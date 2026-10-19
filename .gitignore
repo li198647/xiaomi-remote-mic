@@ -1,0 +1,20 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 运行日志与本地备份
+*.log
+*.bak
+*.tmp
+
+# 编辑器 / 系统杂项
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# 虚拟环境（本项目零第三方依赖，不需要）
+.venv/
+venv/
+env/

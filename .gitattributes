@@ -1,0 +1,11 @@
+# 统一换行符，避免 Windows/Linux 交叉 clone 时出现整个文件 diff
+* text=auto
+*.py   text eol=lf
+*.md   text eol=lf
+*.ini  text eol=lf
+*.bat  text eol=crlf
+*.inf  text eol=crlf
+*.sys  -text
+*.cat  -text
+*.exe  -text
+*.ico  -text
