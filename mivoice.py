@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-遥控语音 (MiVoice) v1.7
+遥控语音 (MiVoice) v1.8
 =======================
 把「小米蓝牙语音遥控器」（RC003 同款，VID 0x2717 / PID 0x32B8）的语音键，
-变成 WorkBuddy 对话框的语音输入。
+变成 WorkBuddy 对话框的语音输入；顺手把两个闲置键变成鼠标滚轮。
 
-日常用法（三步）：
+日常用法：
   1. 点进 WorkBuddy 的输入框（让光标在对话框里）
   2. 按住遥控器语音键，说话
   3. 松手 -> WorkBuddy 自动转写，文字出现在输入框里
   4. 按遥控器 OK 键 -> 变成 Ctrl+Enter -> 发送
+  5. 按遥控器 菜单键 -> 鼠标向上滚（看上面的内容）
+     按遥控器 TV 键  -> 鼠标向下滚（看下面的内容）
 
 原理：
   按住语音键 -> 遥控器经 BLE ATVV 协议推麦克风音频
@@ -36,11 +38,24 @@
       于是：
         按下 -> 吞掉（前台程序收不到，不会插入换行）
         抬起 -> 放行 -> Raw Input 到达 -> 拿到 hDevice
-             -> 是遥控器 -> 发 ctrl+enter
+             -> 是遥控器 -> 执行该键的动作（发送 / 上滚 / 下滚）
              -> 是别的设备 -> 把刚才吞掉的按下**补发**回去
   另外还修了 v1.6 的一个真 bug：SendInput 注入的按键会产生 hdev=0 的
   Raw Input 回声，v1.6 把它当成「实体键盘按了发送键」，污染判据，
   导致**第一次之后每一次都失败**。v1.7 直接丢弃 hdev=0 的事件。
+
+🔴 v1.8：遥控器的「音量键 / 返回键」彻底放弃，改成映射两个闲置键
+  实测结论（tools\\probe_hidden_keys.py + 低级钩子）：
+    · 遥控器在系统里**只有一个 HID 集合，而且是键盘集合(\\kbd)**，
+      没有独立的「消费键」集合 -> 音量/返回键没有用户态通道
+    · 该集合被系统键盘驱动独占（CreateFile err=5），原始报告读不到
+    · Raw Input 的「通用 HID 页 0x00/0x00」在本机非法（err=87）
+    · 按下音量/返回键时，**连低级键盘钩子都收不到任何事件**
+  所以改用遥控器上两个默认没功能的键：
+    菜单键（Apps, 0x5D） -> 鼠标向上滚（看上面）
+    TV 键（0xC0）       -> 鼠标向下滚（看下面）
+  映射复用 v1.7 的仲裁器（吞下、放开抬、按抬起那一条 Raw Input 定性），
+  所以实体键盘的「菜单键」不会误伤（会被原样补发）。
 
 前置条件（一次性）：
   - 安装 VB-CABLE 虚拟声卡（管理员 + 重启一次）
@@ -73,7 +88,7 @@ import traceback
 # 0. 基本路径 / 日志
 # ===========================================================================
 APP_NAME = "遥控语音"
-APP_VER = "1.7"
+APP_VER = "1.8"
 HERE = os.path.dirname(os.path.abspath(__file__))
 INI_PATH = os.path.join(HERE, "mivoice.ini")
 LOG_PATH = os.path.join(HERE, "mivoice.log")
@@ -194,6 +209,11 @@ SM_CXSMICON = 49
 
 # 输入模拟
 INPUT_KEYBOARD = 1
+INPUT_MOUSE = 0
+# 鼠标滚轮。mouseData 放「滚动量」，正数 = 向上/向前滚（看上面的内容），
+# 负数 = 向下/向后滚。WHEEL_DELTA(120) 是 Windows 定义的「一格」。
+MOUSEEVENTF_WHEEL = 0x0800
+WHEEL_DELTA = 120
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_EXTENDEDKEY = 0x0001   # 扩展键（方向键/Home/Menu 等）必须带上，否则键位不对
 VK_MENU = 0x12        # Alt（通用）
@@ -678,6 +698,16 @@ DEFAULTS = {
                                       #    （v1.6 的 400 是从「按下」算起，人按住回车
                                       #      稍久一点就会误超时，所以 v1.7 改成从抬起算起。）
         "hide_remote_f5": "1",        # 1 = 藏掉遥控器语音键(F5)，否则 WorkBuddy 会误判成组合键
+        # ---- 🔴 v1.8：遥控器按键 -> 鼠标滚轮 ----
+        # 为什么做这个：音量键 / 返回键在 Windows 上**压根不上报**
+        #（探针 probe_hidden_keys.py 实测：遥控器在系统里只有一个键盘集合，
+        #  这三个键连低级钩子都收不到）。所以改用遥控器上两个没有默认功能的键。
+        "scroll_enable": "1",         # 1 = 启用滚轮键映射
+        "scroll_up_key": "apps",      # 菜单键（vk=0x5D）-> 向上滚（看上面的内容）
+        "scroll_down_key": "0xc0",    # TV 键（vk=0xC0）   -> 向下滚（看下面的内容）
+        "scroll_step": "120",         # 一次滚动量。120 = Windows 定义的一格（约 3 行）
+        "scroll_repeat_ms": "120",    # 按住不放时的连续滚动间隔（毫秒）
+        # ---- 结束 ----
         "hotkey_quit": "Ctrl+Shift+M",  # 退出热键（实测 Ctrl+Alt+M/V/O/Q/X/Z/L 已被占用）
         "autostart": "0",             # 开机自启（托盘菜单可切，会写回本文件）
     },
@@ -1269,6 +1299,9 @@ VK_LABELS = {
     0x0D: "Enter 回车", 0x20: "空格", 0x09: "Tab", 0x1B: "Esc",
     0x25: "左方向键", 0x26: "上方向键", 0x27: "右方向键", 0x28: "下方向键",
     0x5D: "菜单键", 0x6E: "小键盘 Enter",
+    # 🔴 v1.8：小米遥控器的 TV 键。0xC0 在 Windows 里没有官方 VK 名
+    #（KMODE_MEDIA 之类都不是），是遥控器固件自己报的一个自定义键值。
+    0xC0: "TV 键",
     0xAD: "静音", 0xAE: "音量-", 0xAF: "音量+",
     0xB0: "下一曲", 0xB1: "上一曲", 0xB2: "停止", 0xB3: "播放/暂停",
     0xAC: "浏览器主页",
@@ -1421,6 +1454,26 @@ class KeySender:
         if n != 2:
             raise OSError("SendInput 补发按键失败 err=%s" % ctypes.get_last_error())
         dbg("replay vk=0x%02X scan=0x%02X ext=%s" % (vk, scan, extended))
+        return True
+
+    def scroll(self, delta: int, horizontal: bool = False):
+        """发一次鼠标滚轮。
+
+        delta > 0 = 向上/向前滚（看上面的内容）；< 0 = 向下/向后滚。
+        WHEEL_DELTA(120) = Windows 定义的一格（通常 3 行，随系统设置变化）。
+
+        ⚠️ `mouseData` 是 **DWORD**，而 SendInput 要求负数用**补码**传，
+        所以 -120 要写成 0xFFFFFF88。这里用 `& 0xFFFFFFFF` 转换，
+        不转的话 ctypes 会抛 "int too large to convert to DWORD" 或用错值。
+        """
+        inp = INPUT()
+        inp.type = INPUT_MOUSE
+        inp.mi = MOUSEINPUT(0, 0, int(delta) & 0xFFFFFFFF,
+                            MOUSEEVENTF_WHEEL, 0, None)
+        n = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        if n != 1:
+            raise OSError("SendInput 滚轮失败 err=%s" % ctypes.get_last_error())
+        dbg("wheel delta=%+d" % delta)
         return True
 
     def release_all(self):
@@ -1769,9 +1822,18 @@ def struct_unpack_q(buf, off):
 
 
 class SendArbiter:
-    """发送键仲裁器：把遥控器的 OK 键变成发送快捷键，同时绝不误伤实体键盘。
+    """映射键仲裁器：把遥控器上的几个键变成「发送 / 滚轮」，同时绝不误伤实体键盘。
 
-    🔴🔴🔴 v1.7 架构翻新（本次的**真根因修复**，三条全部经实测钉死）：
+    🔴 v1.8：从「只会把 OK 键变成 Ctrl+Enter」扩成**通用的按键映射仲裁器**。
+    因为音量键 / 返回键在 Windows 上压根不上报（木木 2026-10-30 实测 + 探针
+    `tools\\probe_hidden_keys.py` 验证），改用遥控器上两个**没有默认功能**的键：
+
+        菜单键（Apps, vk=0x5D）  -> 鼠标滚轮向上（看上面的内容）
+        TV 键（vk=0xC0）        -> 鼠标滚轮向下（看下面的内容）
+
+    映射表由 `App.hook_action_for(vk)` 提供，本类只负责「吞 → 确认设备 → 执行」。
+
+    🔴🔴🔴 v1.7 架构翻新（**真根因修复**，三条全部经实测钉死）：
 
       v1.3~v1.6 用的链路是：
           钩子先吞 -> 等 Raw Input 确认设备归属 -> 决定发送还是补发
@@ -1789,19 +1851,19 @@ class SendArbiter:
           **只吞「按下」，把「抬起」放行** —— 抬起那一条 Raw Input 照样会到，
           而它带的 hDevice 就是**这一下按键的确定**设备归属。
 
-            按下 -> 吞掉（前台程序收不到，不会插入换行）
+            按下 -> 吞掉（前台程序收不到，不会插入换行 / 不会弹菜单）
             抬起 -> 放行 -> Raw Input 到达 -> 拿到 hDevice
-                 -> 是遥控器 -> 发 send_keys（默认 ctrl+enter）
+                 -> 是遥控器 -> 执行该键的动作（发送 / 上滚 / 下滚）
                  -> 是别的设备 -> 把刚才吞掉的按下**原样补发**回去
 
       ⚠️ 因此本类**故意打破**「吞了按下就必须吞抬起」的配对原则：
-         发送键的抬起**必须放行**，否则拿不到设备归属。
+         映射键的抬起**必须放行**，否则拿不到设备归属。
          代价 = 前台程序会收到一个「没有按下过的抬起」—— 对输入框无害
          （不会插入任何字符），换来的是**确定**的判定。
          （F5 语音键那边仍然保持配对原则，是另一条逻辑，不冲突。）
 
     ⚠️ 补发（replay）是安全网的关键：宁可「晚几毫秒送达」，
-       也不能让用户的回车凭空消失。
+       也不能让用户的按键凭空消失。
     """
 
     MAX_PENDING = 16
@@ -1812,6 +1874,12 @@ class SendArbiter:
     #    取 300ms：远大于系统最快重复速率（约 33ms/次），
     #    也远小于人「松开再按」的正常间隔（>100ms）。
     REPEAT_GAP = 0.300
+    # 🔴 v1.8：滚轮键的「自动重复」窗口放宽到 3 秒。
+    #    原因：系统**第一次自动重复**出现在按住约 500ms 后（Windows 默认
+    #    RepeatDelay），那时距首次按下已经超过 300ms —— 用 send 的 300ms 判据
+    #    会把这次重复误判成「新按下」，凭空多出一条 pending。
+    #    滚轮不怕多滚一次，怕的是判错，所以放宽到 3 秒（按住滚动是正常用法）。
+    SCROLL_REPEAT_GAP = 3.000
     # 🔴 v1.7：抬起之后等多久去问「抬起那条 Raw Input 到了没」。
     #    实测抬起事件是毫秒级到达的，800ms 只是保险丝。
     CONFIRM_WAIT_MS = 800
@@ -1822,16 +1890,26 @@ class SendArbiter:
     def __init__(self, app):
         self.app = app
         self._lock = threading.Lock()
-        self._pending = []          # FIFO：每条 = 一次「被吞掉的发送键」
+        self._pending = []          # FIFO：每条 = 一次「被吞掉的映射键」
         self._up_vk = 0             # 需要把抬起也吞掉的那个 vk
         self._cycle_vk = 0          # 本次「按住周期」正在吞的 vk
         self._cycle_ts = 0.0        # 本周期最后一次 down 的时刻
+        # 🔴 v1.8：按住滚轮键不放 -> 由主线程定时器节流着连续滚
+        self._repeat_action = ""    # 现在正被「按住」的滚动动作（keyup 时清空）
+        self._repeat_emit_ts = 0.0  # 上次发出重复滚动的时间
         self.stats = {"sent": 0, "replayed": 0, "timeout": 0, "dropped": 0,
-                      "repeat": 0, "up_raw": 0}
+                      "repeat": 0, "up_raw": 0, "scrolled": 0,
+                      # 🔴 v1.8：抬起事件的 vk 和按下时对不上（VKey=0xFF 之类）
+                      "up_vk_mismatch": 0}
 
     # ---------------- 钩子侧（同步，必须快：不写日志、不阻塞） ----------------
-    def on_hook_down(self, kb) -> bool:
-        """钩子收到发送键 keydown。返回 True = 吞掉这一下。
+    def on_hook_down(self, kb, action: str) -> bool:
+        """钩子收到某个「映射键」的 keydown。返回 True = 吞掉这一下。
+
+        `action` 由 `App.hook_action_for(vk)` 给出，取值：
+          "send"        OK 键 / 回车 -> 发送快捷键
+          "scroll_up"   菜单键       -> 鼠标滚轮向上
+          "scroll_down" TV 键        -> 鼠标滚轮向下
 
         🔴 v1.6 关键修复：**按住不放不能连发！**
 
@@ -1844,36 +1922,46 @@ class SendArbiter:
         自动重复的 keydown 照吞（不能让真实回车漏到前台程序），
         但不再新增 pending。
 
+        🔴 v1.8：滚轮动作的自动重复**不丢弃**，而是记到 `_repeat_action`，
+        交给 100ms 定时器节流着连续发 —— 按住菜单键持续滚动才符合直觉。
+
         ⚠️ 怎么区分「按住不放的自动重复」和「松开后再按一次」？
            **靠 keyup**：系统的自动重复**不产生 keyup**，人的两次独立按键
            **一定产生 keyup**。所以：
              · on_hook_up  -> 清掉 _cycle_vk（本次按住周期结束）
              · on_hook_down -> 若 _cycle_vk 仍是同一个 vk，就是自动重复
-           时间阈值 REPEAT_GAP 只兜底「keyup 丢失」，不是主要判据。
+           时间阈值只兜底「keyup 丢失」，不是主要判据。
 
         🔴 v1.7：**无条件吞掉按下**（前置条件满足时）。
            因为「抬起」那一条 Raw Input 会给出**确定**的设备归属，
-           吞下去也不会丢信息；万一判成实体键盘，回车会被**原样补发**回来。
+           吞下去也不会丢信息；万一判成实体键盘，按键会被**原样补发**回来。
         """
         try:
-            if not self.app.ok_precheck():
+            if not self.app.action_precheck(action):
                 return False
             now = time.time()
+            gap = (self.SCROLL_REPEAT_GAP if action.startswith("scroll")
+                   else self.REPEAT_GAP)
             with self._lock:
                 vk = kb.vkCode
                 if (self._cycle_vk == vk
-                        and (now - self._cycle_ts) < self.REPEAT_GAP):
+                        and (now - self._cycle_ts) < gap):
                     # 自动重复：吞掉，但**不新增 pending**
                     self.stats["repeat"] += 1
                     self._cycle_ts = now
                     self._up_vk = vk
+                    if action.startswith("scroll"):
+                        # 滚轮：按住就该持续滚 -> 交给定时器节流发
+                        self._repeat_action = action
                     return True
                 self._cycle_vk = vk
                 self._cycle_ts = now
+                self._repeat_action = ""
                 self._pending.append({
                     "vk": vk,
                     "scan": kb.scanCode,
                     "ext": bool(kb.flags & 0x01),   # LLKHF_EXTENDED
+                    "action": action,
                     "ts": now,
                     "up_ts": None,     # 🔴 v1.7：抬起发生的时间（钩子看到时填）
                     "done": False,
@@ -1906,6 +1994,7 @@ class SendArbiter:
                 if self._up_vk == kb.vkCode:
                     self._up_vk = 0
                     self._cycle_vk = 0       # 本次按住周期结束
+                    self._repeat_action = ""  # 🔴 v1.8：停止「按住连续滚动」
                     # 标记「抬起已经发生」，等它那条 Raw Input 来定性
                     for p in reversed(self._pending):
                         if not p["done"] and p["up_ts"] is None:
@@ -1932,22 +2021,44 @@ class SendArbiter:
         这一步是整套新架构的落点：
           抬起被放行，所以 Raw Input 一定会到；
           它带的 hDevice 就是**这一下按键**按下去的设备。
+
+        🔴 v1.8：不再写死「只认发送键」—— 按下时把动作记进 pending，
+        这里按 `vkey` 找回对应的 pending，再按它自己的动作分派
+        （发送 / 上滚 / 下滚）。
         """
         try:
-            if vkey != self.app.send_key_vk:
-                return False
             with self._lock:
                 pend = None
+                # ① 先按 vk 精确匹配（正常情况都走这条）
                 for p in self._pending:
-                    if (not p["done"]) and p["up_ts"] is not None:
+                    if (not p["done"]) and p["up_ts"] is not None \
+                            and p["vk"] == vkey:
                         pend = p
                         break
                 if pend is None:
+                    # ② 后备：还没结算的 pending 里挑**最早抬起**的那一条。
+                    #    ⚠️ 为什么需要这个：RAWKEYBOARD.VKey 在个别键上可能是
+                    #    0xFF（KEYBOARD_OVERRUN，表示「系统翻译不出来」），
+                    #    那样精确匹配就失败、只能靠看门狗的时间窗兜底。
+                    #    pending 正常情况下只有 1 条（一次按下-抬起一对），
+                    #    所以这里配错的概率极低，比走时间窗准得多。
+                    for p in self._pending:
+                        if (not p["done"]) and p["up_ts"] is not None:
+                            pend = p
+                            break
+                if pend is None:
                     return False
                 pend["done"] = True
+                action = pend["action"]
+                exact = (pend["vk"] == vkey)
             self.stats["up_raw"] += 1
+            if not exact:
+                self.stats["up_vk_mismatch"] += 1
+                log("抬起事件 vk=0x%02X 与按下时 vk=0x%02X 不一致 -> "
+                    "按「最早抬起的那一条」配对（累积 %d 次）"
+                    % (vkey, pend["vk"], self.stats["up_vk_mismatch"]))
             if is_remote:
-                self._do_send("up")
+                self._do_action(action, "up")
             else:
                 self._do_replay(pend, "up")
             return True
@@ -1956,9 +2067,14 @@ class SendArbiter:
 
     # ---------------- 看门狗（主线程定时器） ----------------
     def tick(self):
-        """抬起那条 Raw Input 迟迟不来时的兜底（按时间窗猜）。"""
+        """100ms 心跳，做两件事：
+
+        1. 🔴 v1.8：**按住滚轮键的连续滚动**（自动重复在这里节流发出）；
+        2. 抬起那条 Raw Input 迟迟不来时的兜底（按时间窗猜）。
+        """
         try:
             now = time.time()
+            self._pump_scroll_repeat(now)
             confirm = self.app.send_confirm_ms / 1000.0
             hold = self.HOLD_TIMEOUT_MS / 1000.0
             overdue = []
@@ -1981,9 +2097,9 @@ class SendArbiter:
                 self.stats["timeout"] += 1
                 remote, why = self.app.send_key_verdict()
                 if remote:
-                    log("看门狗兜底：抬起确认没等到（%s）-> 按「遥控器」处理 -> 发 %s"
-                        % (why, self.app.send_spec))
-                    self._do_send("timeout")
+                    log("看门狗兜底：抬起确认没等到（%s）-> 按「遥控器」处理 -> %s"
+                        % (why, self._describe(p["action"])))
+                    self._do_action(p["action"], "timeout")
                 else:
                     log("看门狗兜底：抬起确认没等到（%s）-> 按「实体键盘」处理 -> 补发原键"
                         % why)
@@ -1991,7 +2107,44 @@ class SendArbiter:
         except Exception:
             pass
 
+    def _pump_scroll_repeat(self, now: float):
+        """按住滚轮键不放时，按 `scroll_repeat_ms` 节流连续滚。
+
+        ⚠️ 为什么不在钩子里直接 SendInput：
+          低级钩子回调里做 I/O 会拖慢整条键盘链（严重时全系统卡键盘）。
+          这里放在主线程 100ms 定时器里，钩子只管「记下要重复」。
+        """
+        with self._lock:
+            act = self._repeat_action
+        if not act:
+            return
+        gap = max(50, self.app.scroll_repeat_ms) / 1000.0
+        if (now - self._repeat_emit_ts) < gap:
+            return
+        self._repeat_emit_ts = now
+        self._do_scroll(act, "repeat")
+
     # ---------------- 落地动作 ----------------
+    def _describe(self, action: str) -> str:
+        if action == "send":
+            return "发 %s" % self.app.send_spec
+        if action == "scroll_up":
+            return "鼠标向上滚"
+        if action == "scroll_down":
+            return "鼠标向下滚"
+        return action
+
+    def _do_action(self, action: str, via: str):
+        """按动作类型分派。v1.8 从「只会发送」变成「发送 / 上滚 / 下滚」。"""
+        if action == "send":
+            self._do_send(via)
+        elif action in ("scroll_up", "scroll_down"):
+            self._do_scroll(action, via)
+        else:
+            # 未知动作：宁可记一笔，也别静默吞掉用户的按键
+            dbg("未知动作 %r（来源 %s），按发送处理" % (action, via))
+            self._do_send(via)
+
     def _do_send(self, via: str):
         try:
             self.app.keys.send_combo(self.app.send_spec)
@@ -2001,6 +2154,30 @@ class SendArbiter:
                 % (self.app.send_key_name, self.app.send_spec, via))
         except Exception as e:
             log("发送键转换失败: %r" % (e,))
+
+    def _do_scroll(self, action: str, via: str):
+        """把遥控器按键变成一次鼠标滚轮。
+
+        `scroll_up` = delta 正数 = 向上/向前滚（看**上面**的内容）；
+        `scroll_down` = delta 负数 = 向下/向后滚（看**下面**的内容）。
+        """
+        try:
+            step = self.app.scroll_step
+            delta = step if action == "scroll_up" else -step
+            self.app.keys.scroll(delta)
+            self.app.scroll_count += 1
+            self.stats["scrolled"] += 1
+            # 按住连续滚动会刷屏 -> 每秒最多记一条
+            now = time.time()
+            if via != "repeat" or (now - self.app._last_scroll_log) > 1.0:
+                self.app._last_scroll_log = now
+                log("滚轮键已转换：%s -> %s（来源 %s）"
+                    % (self.app.scroll_key_name(action),
+                       "向上滚（看上面）" if delta > 0 else "向下滚（看下面）",
+                       via))
+        except Exception as e:
+            self.stats["dropped"] += 1
+            log("！！滚轮注入失败: %r" % (e,))
 
     def _do_replay(self, pend: dict, via: str):
         try:
@@ -2122,21 +2299,24 @@ class EnterSendHook:
                 swallowed = self._handle_f5(wParam, kb)
                 if swallowed:
                     tag = "SWAL"
-                # 发送键交给仲裁器：吞掉「按下」，放行「抬起」
+                # 映射键（发送 / 上滚 / 下滚）交给仲裁器：
+                # 吞掉「按下」，放行「抬起」
                 elif (self.app.arbiter is not None
-                        and kb.vkCode == self.app.send_key_vk
                         and not (kb.flags & LLKHF_INJECTED)):
-                    if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                        swallowed = self.app.arbiter.on_hook_down(kb)
-                        if swallowed:
-                            tag = "SND"
-                    elif wParam in (WM_KEYUP, WM_SYSKEYUP):
-                        # 🔴🔴 v1.7：抬起**必须放行**！
-                        #    抬起放行 -> 抬起那条 Raw Input 才会到 ->
-                        #    它的 hDevice 就是这一下按键的**确定**设备归属。
-                        #    （v1.3~v1.6 一直吞抬起，所以永远拿不到 Raw Input。）
-                        swallowed = self.app.arbiter.on_hook_up(kb)
-                        tag = "UPE"       # 抬起放行 -> Raw Input 会到
+                    act = self.app.hook_action_for(kb.vkCode)
+                    if act is not None:
+                        if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                            swallowed = self.app.arbiter.on_hook_down(kb, act)
+                            if swallowed:
+                                tag = ("SCR" if act.startswith("scroll")
+                                       else "SND")
+                        elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+                            # 🔴🔴 v1.7：抬起**必须放行**！
+                            #    抬起放行 -> 抬起那条 Raw Input 才会到 ->
+                            #    它的 hDevice 就是这一下按键的**确定**设备归属。
+                            #    （v1.3~v1.6 一直吞抬起，所以永远拿不到 Raw Input。）
+                            swallowed = self.app.arbiter.on_hook_up(kb)
+                            tag = "UPE"   # 抬起放行 -> Raw Input 会到
                 self._record_key(wParam, kb, swallowed, tag)
                 if swallowed:
                     return 1
@@ -2229,7 +2409,9 @@ class EnterSendHook:
 
         tag 用来区分「为什么被吞」：
           "SWAL" = 遥控器语音键 F5 被吞（防 WorkBuddy 误判组合键）
-          "SND"  = 发送键被仲裁器吞（等 Raw Input 确认设备归属）
+          "SND"  = 发送键被仲裁器吞（等抬起那条 Raw Input 确认设备归属）
+          "SCR"  = 滚轮键被仲裁器吞（同上，只是动作换成鼠标滚轮）
+          "UPE"  = 映射键的抬起被**故意放行**（这样 Raw Input 才会到）
         """
         try:
             app = self.app
@@ -2512,6 +2694,33 @@ class App:
         # 根因：WorkBuddy 的 useVoiceAltHotkey 不检查 e.repeat，
         # 遥控器语音键的自动重复会被判成「组合键」而立刻 stop。
         self.hide_remote_f5 = self.cfg.b("general", "hide_remote_f5")
+        # ---- 🔴 v1.8：遥控器按键 -> 鼠标滚轮 ----
+        self.scroll_enable = self.cfg.b("general", "scroll_enable")
+        self.scroll_up_spec = self.cfg.s("general", "scroll_up_key") or "apps"
+        self.scroll_down_spec = self.cfg.s("general", "scroll_down_key") or "0xc0"
+        self.scroll_up_vk = parse_vk_spec(self.scroll_up_spec)
+        self.scroll_down_vk = parse_vk_spec(self.scroll_down_spec)
+        if self.scroll_up_spec and self.scroll_up_vk is None:
+            log("！！scroll_up_key=%r 解析不出来，向上滚不启用"
+                % self.scroll_up_spec)
+        if self.scroll_down_spec and self.scroll_down_vk is None:
+            log("！！scroll_down_key=%r 解析不出来，向下滚不启用"
+                % self.scroll_down_spec)
+        # 滚动量：屏蔽掉明显不合理的值（太小没反应，太大一滚飞出去）
+        self.scroll_step = min(1200, max(20, self.cfg.i("general", "scroll_step")))
+        self.scroll_repeat_ms = min(1000, max(
+            50, self.cfg.i("general", "scroll_repeat_ms")))
+        # 遥控器上「同一个键」被配成两个动作时，发送优先，这里提前报警
+        if (self.scroll_up_vk and self.scroll_up_vk == self.send_key_vk) or \
+                (self.scroll_down_vk and self.scroll_down_vk == self.send_key_vk):
+            log("！！滚轮键和发送键配成了同一个键（0x%02X），"
+                "该键只会发送、不会滚动 —— 请改 mivoice.ini"
+                % self.send_key_vk)
+        if self.scroll_up_vk and self.scroll_up_vk == self.scroll_down_vk:
+            log("！！scroll_up_key 和 scroll_down_key 配成了同一个键（0x%02X），"
+                "向下滚会失效" % self.scroll_up_vk)
+        self.scroll_on = bool(
+            self.scroll_enable and (self.scroll_up_vk or self.scroll_down_vk))
         self.host = None
         self.tray = None
         self.remote = None
@@ -2524,6 +2733,8 @@ class App:
         self.ime_flag = False        # 输入法是否在组词（ImeProbe 线程维护）
         self.ime_probe = None
         self.ok_send_count = 0
+        self.scroll_count = 0        # 🔴 v1.8：滚轮键触发次数
+        self._last_scroll_log = 0.0  # 滚轮日志节流（按住连滚会刷屏）
         self._last_f5_raw_log = 0.0     # 语音键原始事件的日志节流
         self._last_other_raw_log = 0.0  # 其它设备按发送键的日志节流
         self._want_reconnect = False
@@ -2582,7 +2793,9 @@ class App:
             if key is None:
                 log("！！send_keys=%r 解析失败，OK 键发送不启用" % self.send_spec)
                 self.ok_to_send = False
-        if self.ok_to_send:
+        # 🔴 v1.8：滚轮映射也需要 arbiter + Raw Input（判设备归属），
+        #    所以条件从「ok_to_send」放宽成「任一映射启用」。
+        if self.ok_to_send or self.scroll_on:
             self.arbiter = SendArbiter(self)
             self.remote_input = RemoteInputWatcher(
                 self.host, self.cfg.s("general", "device_match"),
@@ -2592,9 +2805,21 @@ class App:
             self.remote_input.register()
             self.ime_probe = ImeProbe(self)
             self.ime_probe.start()
-            log("OK 键发送已启用：%s -> %s（仅前台窗口含 %r）"
-                % (self.send_key_name, self.send_spec,
-                   self.ok_send_title or "<任意>"))
+            if self.ok_to_send:
+                log("OK 键发送已启用：%s -> %s（仅前台窗口含 %r）"
+                    % (self.send_key_name, self.send_spec,
+                       self.ok_send_title or "<任意>"))
+            if self.scroll_on:
+                parts = []
+                if self.scroll_up_vk:
+                    parts.append("%s -> 向上滚（看上面）"
+                                 % vk_label(self.scroll_up_vk))
+                if self.scroll_down_vk:
+                    parts.append("%s -> 向下滚（看下面）"
+                                 % vk_label(self.scroll_down_vk))
+                log("滚轮键已启用：%s（任意窗口生效；一步 %d，按住每 %dms 滚一次）"
+                    % ("；".join(parts), self.scroll_step,
+                       self.scroll_repeat_ms))
             log("  判定方式 v1.7：吞掉「按下」、放行「抬起」，"
                 "用抬起那条 Raw Input 的设备归属定性"
                 "（抬起确认超过 %dms 未到则按最近 %dms 活动兜底）"
@@ -2838,6 +3063,50 @@ class App:
         if self.remote_input:
             self.remote_input.last_activity = time.time()
 
+    # ---------------- 🔴 v1.8：按键映射（发送 / 上滚 / 下滚） ----------------
+    def hook_action_for(self, vk: int):
+        """这个 vk 对应哪个动作？没有映射就返回 None。
+
+        ⚠️ 钩子回调里会调它，所以**必须极快**：只做整数比较，不查表不求值。
+        顺序有意义：发送优先（怕 ini 配重了之后滚轮抢走 OK 键）。
+        """
+        if self.ok_to_send and vk == self.send_key_vk:
+            return "send"
+        if self.scroll_on:
+            if self.scroll_up_vk and vk == self.scroll_up_vk:
+                return "scroll_up"
+            if self.scroll_down_vk and vk == self.scroll_down_vk:
+                return "scroll_down"
+        return None
+
+    def action_precheck(self, action: str) -> bool:
+        """钩子里的前置条件：这个动作要不要进入仲裁。
+
+        🔴 发送和滚轮的**判据不一样**：
+          · 发送：只在前台是 WorkBuddy 时生效（别在别的程序里把回车改成 Ctrl+Enter）
+          · 滚轮：**任何窗口都生效** —— 木木要用它翻网页、翻文档、翻聊天记录，
+                  限制成 WorkBuddy 就等于没用
+        """
+        if action == "send":
+            return self.ok_precheck()
+        return self.scroll_precheck()
+
+    def scroll_precheck(self) -> bool:
+        """滚轮键的前置条件（比发送宽松得多）。
+
+        仍然检查「有没有按着修饰键」：木木自己按 Ctrl+菜单键时不掺和，
+        免得把系统快捷键吃掉。
+        """
+        if not self.scroll_on or not self.enabled:
+            return False
+        if self.enter_hook is not None and self.enter_hook.mods_down():
+            return False
+        return True
+
+    def scroll_key_name(self, action: str) -> str:
+        vk = self.scroll_up_vk if action == "scroll_up" else self.scroll_down_vk
+        return vk_label(vk) if vk else action
+
     def ok_precheck(self) -> bool:
         """钩子里的**前置条件**判定：这一下要不要进入「发送键仲裁」。
 
@@ -2998,8 +3267,10 @@ class App:
                     src = "INJ" if (flags & LLKHF_INJECTED) else "HW "
                     if tag == "SND":
                         src = "SND"          # 发送键「按下」被仲裁器吞
+                    elif tag == "SCR":
+                        src = "SCR"          # 滚轮键「按下」被仲裁器吞
                     elif tag == "UPE":
-                        src = "UPE"          # 发送键「抬起」放行 -> Raw Input 会到
+                        src = "UPE"          # 映射键「抬起」放行 -> Raw Input 会到
                     elif tag == "SWAL" or swallowed:
                         src = "SWAL"          # 被 MiVoice 拦下，没送到 WorkBuddy
                     f.write("%s  %-7s vk=0x%02X scan=0x%02X flags=0x%X %s "
@@ -3022,7 +3293,12 @@ class App:
             tip = "%s | 录音中…" % APP_NAME
             icon = self._hicon_rec
         elif self.remote and self.remote.connected:
-            extra = ("，发送 %d 次" % self.ok_send_count) if self.ok_to_send else ""
+            bits = []
+            if self.ok_to_send:
+                bits.append("发送 %d 次" % self.ok_send_count)
+            if self.scroll_on:
+                bits.append("滚动 %d 次" % self.scroll_count)
+            extra = ("，" + "，".join(bits)) if bits else ""
             tip = "%s | 待命（语音 %d 次%s）" % (APP_NAME, self.sessions_ok, extra)
             icon = self._hicon_idle
         else:

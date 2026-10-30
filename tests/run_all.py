@@ -146,11 +146,13 @@ def t_hotkey_parse():
 
 # ---------------- OK 键 -> 发送 ----------------
 class _FakeKeys:
-    """替身：只记录 send_combo / replay_key 被调了什么，绝不往真实桌面注入按键。"""
+    """替身：只记录 send_combo / replay_key / scroll 被调了什么，
+    绝不往真实桌面注入按键。"""
 
     def __init__(self):
         self.calls = []
         self.replays = []
+        self.wheels = []          # 🔴 v1.8：记录滚轮 delta（正=上滚，负=下滚）
 
     def send_combo(self, spec):
         self.calls.append(spec)
@@ -158,6 +160,10 @@ class _FakeKeys:
 
     def replay_key(self, vk, scan=0, extended=False):
         self.replays.append((vk, scan, extended))
+        return True
+
+    def scroll(self, delta, horizontal=False):
+        self.wheels.append(delta)
         return True
 
 
@@ -974,6 +980,148 @@ def t_up_passthrough():
 
     import importlib
     importlib.reload(M)
+def t_scroll_mapping():
+    """v1.8：遥控器按键 -> 动作映射（发送 / 上滚 / 下滚）。
+
+    背景：音量键 / 返回键在 Windows 上压根不上报（探针
+    tools\\probe_hidden_keys.py 实测），所以改用遥控器上两个闲置键。
+    这条用例锁死「哪个 vk 对应哪个动作」以及「冲突时谁优先」。
+    """
+    app, _hook = _make_sender_app()
+    app.scroll_on = True
+    app.scroll_up_vk = 0x5D          # 菜单键
+    app.scroll_down_vk = 0xC0        # TV 键
+
+    assert app.hook_action_for(M.VK_RETURN) == "send"
+    assert app.hook_action_for(0x5D) == "scroll_up", "菜单键应是向上滚"
+    assert app.hook_action_for(0xC0) == "scroll_down", "TV 键应是向下滚"
+    assert app.hook_action_for(0x41) is None, "没配的键不该有动作"
+
+    # 关掉发送 -> OK 键不再有动作，滚轮不受影响
+    app.ok_to_send = False
+    assert app.hook_action_for(M.VK_RETURN) is None, "ok_to_send 关了不该还有 send"
+    assert app.hook_action_for(0x5D) == "scroll_up", "关发送不该影响滚轮"
+    app.ok_to_send = True
+
+    # 关掉滚轮 -> 滚轮键不再有动作，发送不受影响
+    app.scroll_on = False
+    assert app.hook_action_for(0x5D) is None
+    assert app.hook_action_for(0xC0) is None
+    assert app.hook_action_for(M.VK_RETURN) == "send"
+    app.scroll_on = True
+
+    # 🔴 配重了：同一个键既是发送键又配成上滚键 -> **发送优先**
+    #    （这是明确的设计选择：发送是主线功能，宁可滚不了也不能发不出去）
+    app.scroll_up_vk = M.VK_RETURN
+    assert app.hook_action_for(M.VK_RETURN) == "send", \
+        "同一个键配成发送+上滚时，必须发送优先"
+
+
+def t_scroll_exec():
+    """v1.8：菜单键 -> 向上滚、TV 键 -> 向下滚（复用 v1.7 的仲裁链）。"""
+    M.user32.GetForegroundWindow = lambda: 1
+    M.title_matches = lambda hwnd, part: True
+
+    app, hook = _make_sender_app()
+    app.scroll_on = True
+    app.scroll_up_vk = 0x5D
+    app.scroll_down_vk = 0xC0
+    app.scroll_step = 120
+    # 🔴 故意让「发送」的前置条件不满足（前台窗口不匹配）：
+    #    滚轮键**不该**受这个限制 —— 木木要用它翻网页/翻文档/翻聊天记录，
+    #    限制成 WorkBuddy 就等于没用。
+    app.ok_send_title = "__不存在的窗口__"
+
+    kb = M.KBDLLHOOKSTRUCT(0x5D, 0x00, 0x00, 0, 0)
+    lp = ctypes.addressof(kb)
+
+    # 1) 菜单键：按下被吞、抬起放行、抬起那条 Raw Input 说是遥控器 -> 向上滚
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "菜单键按下没被吞"
+    assert app.keys.wheels == [], "还没定性就滚了"
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
+    app._on_raw_keyup(0x5D, 0x00, True)
+    assert app.keys.wheels == [120], \
+        "菜单键应向上滚(+120)，实际 %r" % (app.keys.wheels,)
+    assert app.keys.calls == [], "滚轮键不该触发发送快捷键"
+
+    # 2) TV 键 -> 向下滚（负的滚动量）
+    kb2 = M.KBDLLHOOKSTRUCT(0xC0, 0x00, 0x00, 0, 0)
+    lp2 = ctypes.addressof(kb2)
+    assert hook._on_key(0, M.WM_KEYDOWN, lp2) == 1
+    hook._on_key(0, M.WM_KEYUP, lp2)
+    app._on_raw_keyup(0xC0, 0x00, True)
+    assert app.keys.wheels == [120, -120], app.keys.wheels
+
+    # 3) 抬起那条 Raw Input 说是**实体键盘** -> 不滚，把原键补发回去
+    #    （不然木木按真实键盘的菜单键会「弹不出右键菜单」）
+    app.keys.wheels = []
+    app.keys.replays = []
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1
+    hook._on_key(0, M.WM_KEYUP, lp)
+    app._on_raw_keyup(0x5D, 0x00, False)
+    assert app.keys.wheels == [], "判成实体键盘时不该滚"
+    assert app.keys.replays == [(0x5D, 0x00, False)], app.keys.replays
+
+    # 4) 按住不放 -> 由看门狗节流连续滚；松开就停
+    app.keys.wheels = []
+    app.scroll_repeat_ms = 50
+    kb3 = M.KBDLLHOOKSTRUCT(0x5D, 0x00, 0x00, 0, 0)
+    lp3 = ctypes.addressof(kb3)
+    hook._on_key(0, M.WM_KEYDOWN, lp3)     # 首次按下 -> 新增 pending
+    hook._on_key(0, M.WM_KEYDOWN, lp3)     # 自动重复 -> 记下「要连滚」
+    app.arbiter._repeat_emit_ts = 0.0
+    app.arbiter.tick()
+    assert app.keys.wheels == [120], \
+        "按住不放应当连续滚，实际 %r" % (app.keys.wheels,)
+    hook._on_key(0, M.WM_KEYUP, lp3)       # 松开 -> 必须停
+    app.arbiter._repeat_emit_ts = 0.0
+    app.arbiter.tick()
+    assert app.keys.wheels == [120], "松开之后不该继续滚"
+
+    # 5) 滚轮键也必须响应「程序暂停」
+    app.enabled = False
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) != 1, "程序暂停时不该吞滚轮键"
+    app.enabled = True
+
+    # 6) 抬起事件的 vk 和按下时**对不上**（RAWKEYBOARD.VKey 可能是 0xFF 表示
+    #    「系统翻译不出来」）-> 必须靠「最早抬起的那一条 pending」配对成功，
+    #    否则就退回时间窗兜底，白丢一次精确判定。
+    app.keys.wheels = []
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1
+    hook._on_key(0, M.WM_KEYUP, lp)
+    app._on_raw_keyup(0xFF, 0x00, True)
+    assert app.keys.wheels == [120], \
+        "抬起 vk 对不上时也要配对成功，实际 %r" % (app.keys.wheels,)
+
+
+def t_scroll_input_layout():
+    """v1.8：滚轮事件的 INPUT 内存布局（这里踩过坑，必须锁死）。
+
+    🔴 `MOUSEINPUT.mouseData` 是 **DWORD（无符号）**，而 Windows 要求
+    向下滚传**负数的补码**（-120 -> 0xFFFFFF88）。
+       · 直接赋 -120 给无符号字段 -> ctypes 抛 / 或截断成错值
+       · 必须 `int(delta) & 0xFFFFFFFF`
+    🔴 `INPUT.type` 的 `INPUT_MOUSE` 是 **0**（不是 1，1 是 KEYBOARD）。
+    """
+    assert ctypes.sizeof(M.INPUT) == 40, \
+        "x64 下 sizeof(INPUT) 必须是 40，实际 %d" % ctypes.sizeof(M.INPUT)
+    assert M.INPUT_MOUSE == 0, "INPUT_MOUSE 必须是 0"
+    assert M.MOUSEEVENTF_WHEEL == 0x0800
+    assert M.WHEEL_DELTA == 120
+
+    inp = M.INPUT()
+    inp.type = M.INPUT_MOUSE
+    inp.mi = M.MOUSEINPUT(0, 0, int(-120) & 0xFFFFFFFF,
+                          M.MOUSEEVENTF_WHEEL, 0, None)
+    assert inp.type == 0
+    assert inp.mi.mouseData == 0xFFFFFF88, hex(inp.mi.mouseData)
+    assert inp.mi.dwFlags == 0x0800
+    # 正数方向
+    inp.mi = M.MOUSEINPUT(0, 0, int(120) & 0xFFFFFFFF,
+                          M.MOUSEEVENTF_WHEEL, 0, None)
+    assert inp.mi.mouseData == 120
+
+
 def main():
     print("MiVoice 回归测试")
     print("=" * 60)
@@ -1000,6 +1148,9 @@ def main():
     check("OK 键：注入回声必须丢弃", t_hdev0_echo)
     check("OK 键：遥控器/实体键盘活动分开记", t_activity_split)
     check("OK 键：抬起必须放行", t_up_passthrough)
+    check("滚轮键：按键 -> 动作映射", t_scroll_mapping)
+    check("滚轮键：菜单上滚 / TV 下滚", t_scroll_exec)
+    check("滚轮键：INPUT 内存布局", t_scroll_input_layout)
     check("F5 拦截（遥控器语音键）", t_f5_swallow)
     print("=" * 60)
     print("通过 %d / %d" % (len(PASS), len(PASS) + len(FAIL)))

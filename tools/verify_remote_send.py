@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""一键验证「遥控器 OK 键 -> 发送」这条链路到底通没通。
+"""一键验证「遥控器 OK 键 -> 发送」+「菜单键/TV 键 -> 滚轮」这条链路到底通没通。
 
 用法：双击 tools\\verify-remote-send.bat
 
 它做三件事：
-  1. 检查 MiVoice 是不是正在运行、是不是 v1.7（v1.3~v1.6 的判定逻辑是坏的：
-     v1.3/v1.4 靠时间窗猜，v1.5 有「设备名读失败被永久缓存」的 bug，
-     v1.6 有「注入回声污染判据、第一次之后每次都失败」的 bug）
+  1. 检查 MiVoice 是不是正在运行、版本是不是 **v1.7 以上**
+     （v1.3/v1.4 靠时间窗猜，v1.5 有「设备名读失败被永久缓存」的 bug，
+       v1.6 有「注入回声污染判据、第一次之后每次都失败」的 bug）
   2. 盯着 mivoice.log，把你按遥控器时冒出来的新行实时打出来
   3. 最后给结论：到底是哪一环出了问题
 
@@ -16,6 +16,11 @@
      -> 日志里会出现「发送键已转换：... （来源 up）」= 精确路径，整条链路通了
      -> 出现「（来源 timeout）」= 抬起确认没等到，靠时间窗兜住了（也能用）
    v1.6 的「来源 raw」在 v1.7 里**不应该再出现**（那条路已经不存在了）。
+
+🔴 v1.8 新增：滚轮键
+   音量键 / 返回键在 Windows 上压根不上报，所以改用两个闲置键：
+     菜单键（Apps, 0x5D）-> 鼠标向上滚   TV 键（0xC0）-> 鼠标向下滚
+   日志标记是「滚轮键已转换：... （来源 up）」。
 
 🔴 还要盯一条新日志：「Raw Input：忽略 hdev=0 的注入回声」
    —— 这是**正常**的（那是我们自己 SendInput 注入的按键）。
@@ -47,6 +52,22 @@ def _find_mivoice() -> str:
 
 
 MIVOICE_DIR = _find_mivoice()
+
+
+def _ver_tuple(v) -> tuple:
+    """把 "1.8" / "v1.8" 转成 (1, 8) 方便比大小。
+
+    解析不出来时返回 (99,) —— **宁可放过也不误判**：
+    版本号是给人看的，格式一旦变了不该把用户的验收直接拦死。
+    """
+    try:
+        return tuple(int(x) for x in str(v).strip().lstrip("vV").split("."))
+    except Exception:
+        return (99,)
+
+
+# 至少要 v1.7（v1.7 起「吞下、放开抬、按抬起那条 Raw Input 定性」才对）
+MIN_VER = (1, 7)
 LOG = os.path.join(MIVOICE_DIR, "mivoice.log")
 STATE = os.path.join(MIVOICE_DIR, "mivoice.state")
 MUTEX_NAME = "Local\\MiVoice_SingleInstance_v1"
@@ -154,16 +175,16 @@ def main():
               % (live_pid, live_ver))
     else:
         print("[i] MiVoice 正在运行（拿不到状态文件，按日志判断）")
-    if live_ver and live_ver != "1.7":
-        print("[!] 跑的是 v%s，不是 v1.7 —— v1.3~v1.6 的判定逻辑都是坏的："
-              "v1.3/v1.4 靠时间窗猜，v1.5 设备名读失败被永久缓存，"
-              "v1.6 注入回声污染判据（第一次之后每次都失败）。再测也是白测。"
-              % live_ver)
+    # 要求 v1.7 及以上：v1.3~v1.6 的判定逻辑都是坏的
+    #   v1.3/v1.4 靠时间窗猜；v1.5 设备名读失败被永久缓存；
+    #   v1.6 注入回声污染判据（第一次之后每次都失败）。
+    if live_ver and _ver_tuple(live_ver) < MIN_VER:
+        print("[!] 跑的是 v%s，太旧了（至少要 v1.7）—— 再测也是白测。" % live_ver)
         print("    请先在托盘图标上右键退出，再重新双击 start-mivoice.bat。")
         input("\n按回车退出…")
         return 1
-    if not live_ver and ver and ver != "v1.7":
-        print("[!] 日志里最后的版本是 %s，不是 v1.7。" % ver)
+    if not live_ver and ver and _ver_tuple(ver) < MIN_VER:
+        print("[!] 日志里最后的版本是 %s，太旧了（至少要 v1.7）。" % ver)
         input("\n按回车退出…")
         return 1
 
@@ -177,7 +198,10 @@ def main():
     print("  1) 鼠标点一下 WorkBuddy 的输入框，让光标在里面")
     print("  2) 按住遥控器的【语音键】说 2 秒钟，然后松手")
     print("  3) 等 1 秒，再按一次遥控器的【OK 键】")
-    print("  4) 盯着下面的窗口，什么都不用管")
+    print("  4) 再按遥控器的【菜单键】【TV 键】各一下（验证滚轮映射，v1.8 新增）")
+    print("     菜单键 = 鼠标向上滚（看上面的内容）")
+    print("     TV 键  = 鼠标向下滚（看下面的内容）")
+    print("  5) 盯着下面的窗口，什么都不用管")
     print()
     print("（最多等 120 秒；按 Ctrl+C 可以随时退出）")
     print("-" * 66)
@@ -185,7 +209,9 @@ def main():
     seen = {"f5_raw": 0, "ok_raw": 0, "converted_up": 0,
             "converted_timeout": 0, "converted_raw": 0,
             "replayed": 0, "other_raw": 0,
-            "no_devname": 0, "devname_ok": 0, "watchdog": 0, "echo": 0}
+            "no_devname": 0, "devname_ok": 0, "watchdog": 0, "echo": 0,
+            "scroll_up": 0, "scroll_down": 0}
+    grace_until = 0.0
     t0 = time.time()
     while time.time() - t0 < 120:
         lines, offset = tail_from(LOG, offset)
@@ -214,12 +240,20 @@ def main():
                     seen["converted_raw"] += 1
             elif "补发原键" in ln:
                 seen["replayed"] += 1
-        if (seen["ok_raw"] or seen["converted_up"] or seen["converted_timeout"]
-                or seen["converted_raw"]):
-            time.sleep(0.6)          # 多等一会儿，看有没有后续
-            lines, offset = tail_from(LOG, offset)
-            for ln in lines:
-                print("  " + ln)
+            elif "滚轮键已转换" in ln:
+                if "向上滚" in ln:
+                    seen["scroll_up"] += 1
+                elif "向下滚" in ln:
+                    seen["scroll_down"] += 1
+        got_main = (seen["ok_raw"] or seen["converted_up"]
+                    or seen["converted_timeout"] or seen["converted_raw"]
+                    or seen["scroll_up"] or seen["scroll_down"])
+        if got_main and not grace_until:
+            # 收到主结果后不要立刻收工 —— 再留 10 秒给滚轮键
+            grace_until = time.time() + 10.0
+            print("  ... 已收到结果，再等 10 秒顺手收【滚轮键】"
+                  "（可以按遥控器的菜单键 / TV 键）...")
+        elif grace_until and time.time() > grace_until:
             break
         time.sleep(0.25)
 
@@ -271,10 +305,20 @@ def main():
         print("  ~ 有 %d 次走了看门狗兜底（抬起确认没在 800ms 内到）"
               % seen["watchdog"])
         print("    -> 兜底也能把消息发出去，但不如精确路径（来源 up）稳")
+    # ---- 🔴 v1.8：滚轮键 ----
+    if seen["scroll_up"] or seen["scroll_down"]:
+        print("  √ 滚轮键生效：向上滚 %d 次 / 向下滚 %d 次"
+              % (seen["scroll_up"], seen["scroll_down"]))
+        print("    -> 菜单键应向上滚、TV 键应向下滚（哪一个没动就看上面计数）")
+    else:
+        print("  ? 没看到「滚轮键已转换」")
+        print("    -> 要么没按菜单键 / TV 键，要么这两个键没被识别成遥控器。")
+        print("       注意：滚轮键**不需要**前台是 WorkBuddy，任何窗口都该生效。")
     print()
-    print("按键日志（看 SND / UPE / SWAL 标记）：%s"
+    print("按键日志（看 SND / SCR / UPE / SWAL 标记）：%s"
           % os.path.join(MIVOICE_DIR, "mivoice_keys.log"))
-    print("  SND = 发送键「按下」被吞；UPE = 发送键「抬起」放行（v1.7 的关键）")
+    print("  SND = 发送键「按下」被吞；SCR = 滚轮键「按下」被吞；")
+    print("  UPE = 映射键「抬起」放行（v1.7 的关键：抬起那条 Raw Input 才有设备归属）")
     print("完整日志：%s" % LOG)
     input("\n按回车退出…")
     return 0
