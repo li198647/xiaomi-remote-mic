@@ -11,7 +11,9 @@ WorkBuddy 对话框的语音输入：按住说话，松手出字。
 
 > 📁 **路径说明**：本文档写的是本机安装路径 `E:\workbuddywork\win10小修小补\mivoice\`。
 > 如果你是 clone 下来的，把每个 `E:\workbuddywork\win10小修小补\mivoice\` 换成自己的克隆目录即可，
-> 目录结构完全一致（`mivoice.py` / `mivoice.ini` / `start-mivoice.bat` / `tests/` / `vbcable/` 都在根目录）。
+> 目录结构完全一致（`mivoice.py` / `mivoice.ini` / `start-mivoice.bat` / `tests/` /
+> `tools/` / `vbcable/` 都在根目录）。文中出现的 `tools\xxx` 都是相对路径，指仓库里的
+> `<克隆目录>\mivoice\tools\`；本机实际路径是 `E:\workbuddywork\win10小修小补\mivoice\tools\`。
 
 ---
 
@@ -71,7 +73,7 @@ VB-CABLE 把「遥控器的麦克风」变成 Windows 能识别的录音设备�
 | 有触发但没文字 | 默认录音设备不是 CABLE Output；或 VB-CABLE 没装/没重启 |
 | 文字音质差、识别率低 | 调大 `gain`（默认 3.0，可到 5.0~8.0）；说话离遥控器近一点 |
 | 遥控器休眠后失灵 | 遥控器 BLE 空闲会断链，**按任意键唤醒它会自动重连**（日志里会出现「遥控器按键唤醒」字样）。若按键后仍无反应：托盘右键 →「重新连接遥控器」 |
-| 按 OK 键没发送 | ① 先确认 WorkBuddy 的发送快捷键真是 Ctrl+Enter：托盘右键 →「测试发送（ctrl+enter）」，光标在输入框里应能触发发送；② 跑 **`E:\workbuddywork\win10小修小补\tools\verify-remote-send.bat`**，它会实时盯着日志并直接给结论（哪一环断了）；③ 日志里要能看到 `键盘钩子已安装` 和 `Raw Input 已注册`，缺哪个就是被安全软件拦了 |
+| 按 OK 键没发送 | ① 先确认 WorkBuddy 的发送快捷键真是 Ctrl+Enter：托盘右键 →「测试发送（ctrl+enter）」，光标在输入框里应能触发发送；② 跑 **`tools\verify-remote-send.bat`**，它会实时盯着日志并直接给结论（哪一环断了）；③ 日志里要能看到 `键盘钩子已安装` 和 `Raw Input 已注册`，缺哪个就是被安全软件拦了 |
 | 想退出程序 | 托盘右键 → 退出；或热键 **Ctrl+Shift+M**（Ctrl+Alt 系列基本都被占了，实测 M/V/O/Q/X/Z/L 全部占用） |
 | 托盘图标被折叠进「^」 | 点开「^」把麦克风图标拖到任务栏上，系统会记住 |
 
@@ -133,7 +135,7 @@ VB-CABLE 把「遥控器的麦克风」变成 Windows 能识别的录音设备�
    （Raw Input 的 `hDevice` → 设备路径里的 `VID&012717`），光看 vk/扫描码/标志位没戏。
 2. `0xC0` = **TV 键**（木木 2026-10-30 实机确认）；`0xFF` 还没有物理名字。
    想确认 `0xFF` 是哪个键，跑
-   **`E:\workbuddywork\win10小修小补\tools\map-remote-keys.bat`** ——
+   **`tools\map-remote-keys.bat`** ——
    它会一个一个点名让你按，按下就记录 VKey，并可顺手把发送键写进 `mivoice.ini`。
 3. **音量键 / 返回键根本不在表里** —— 它们按下去在 Windows 上**一点反应都没有**，
    连低级键盘钩子都收不到。详见下面「已知限制」。
@@ -314,7 +316,7 @@ v1.6 修好了 VKey 读取和设备名缓存，但实测日志里**仍然**出�
 
 #### 实验一：被吞掉的按键，Raw Input 一条都不会到
 
-`E:\workbuddywork\win10小修小补\tools\probe_raw_live.py swallow`
+`tools\probe_raw_live.py swallow`
 （装一个低级键盘钩子，注入 F5，看收不收得到 Raw Input）：
 
 ```
@@ -419,7 +421,8 @@ F5 完全不受影响，也不需要装 Interception 之类的过滤驱动。
 命令行：`--probe` 录一段验证麦克风 / `--alt-test` 测触发 / `--status` 环境自检 /
 `--selftest N` 跑 N 秒自动退出 / `--debug` 详细日志。
 
-配套工具（都在 `E:\workbuddywork\win10小修小补\tools\`）：
+配套工具（都在仓库的 `tools\` 目录里，即 `<克隆目录>\mivoice\tools\`；
+脚本会自己找到上层的 `mivoice.py`，所以放在仓库内外都能跑）：
 
 | 工具 | 干什么 |
 |---|---|
@@ -449,7 +452,7 @@ F5 完全不受影响，也不需要装 Interception 之类的过滤驱动。
   这两个键**连低级键盘钩子都收不到**，说明它们没走「键盘页」（Usage Page 0x01），
   要么是消费键页（Usage Page 0x0C）被 `kbdhid.sys` 在内核层吃掉了，
   要么驱动/固件根本没上报。
-  用 **`E:\workbuddywork\win10小修小补\tools\probe-remote-hid.bat`** 实测一下：
+  用 **`tools\probe-remote-hid.bat`** 实测一下：
   它同时注册键盘页 + 消费键页，能收到的话我们就能自己接管音量/返回；
   收不到就说明用户态无解，得看驱动层面的办法了。
 - 单次录音上限约 60 秒（遥控器固件限制）
@@ -460,7 +463,7 @@ v1.2 之前的「只绿一下」有两个不同的原因，别混：
 
 | 现象 | 根因 | 怎么确认 |
 |---|---|---|
-| WorkBuddy 一直绿、但没声音 | 系统默认录音设备不是 CABLE Output | `python E:\workbuddywork\win10小修小补\tools\audio_default_device.py` 看 Console/Multimedia/Communications 三个角色 |
+| WorkBuddy 一直绿、但没声音 | 系统默认录音设备不是 CABLE Output | `python tools\audio_default_device.py` 看 Console/Multimedia/Communications 三个角色 |
 | WorkBuddy 只绿一下就灭 | 遥控器的 F5 自动重复被 WorkBuddy 判成组合键 | `C:\Users\Administrator\.workbuddy\logs\renderer.old.log` 里搜 `altHotkey combo while holding -> stop` |
 
 第二条的官方诊断日志会在**轮转后**落到 `renderer.old.log`，别只看 `renderer.log`。
@@ -504,14 +507,14 @@ send_keys = ctrl+enter  ; 实际发出去的组合键（对应 WorkBuddy 的发�
 **三种启动方式**（任选其一）：
 
 1. 托盘菜单 → **「扫描遥控器按键（查每个键是什么）」**（最方便）
-2. 双击 `E:\workbuddywork\win10小修小补\tools\scan-remote-keys.bat`
+2. 双击 `tools\scan-remote-keys.bat`
 3. 命令行：
    ```
-   python E:\workbuddywork\win10小修小补\tools\scan_remote_keys.py --seconds 120
+   python tools\scan_remote_keys.py --seconds 120
    ```
 
 扫描时把遥控器上的每个键**各按一下**（别长按），窗口会逐行列出
 `vk / 扫描码 / 来自哪个设备`，最后还有汇总表。
-完整日志：`E:\workbuddywork\win10小修小补\tools\remote_keys_scan.log`
+完整日志：`tools\remote_keys_scan.log`
 
 查到之后把 `send_key` 改成对应名字，改完重启 MiVoice 即可。
