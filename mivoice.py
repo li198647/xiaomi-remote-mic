@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-遥控语音 (MiVoice) v1.0
+遥控语音 (MiVoice) v1.6
 =======================
 把「小米蓝牙语音遥控器」（RC003 同款，VID 0x2717 / PID 0x32B8）的语音键，
 变成 WorkBuddy 对话框的语音输入。
@@ -44,6 +44,7 @@ import ctypes.wintypes as wt
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -53,13 +54,36 @@ import traceback
 # 0. 基本路径 / 日志
 # ===========================================================================
 APP_NAME = "遥控语音"
-APP_VER = "1.0"
+APP_VER = "1.6"
 HERE = os.path.dirname(os.path.abspath(__file__))
 INI_PATH = os.path.join(HERE, "mivoice.ini")
 LOG_PATH = os.path.join(HERE, "mivoice.log")
+KEYLOG_PATH = os.path.join(HERE, "mivoice_keys.log")
+# 运行状态文件：写上「现在跑的是哪个版本、哪个 PID」。
+# 用途：托盘图标被折叠进溢出面板时，用户找不到图标也不知道跑的是哪一版，
+# 这个文件能让排错脚本直接问出答案（不用靠日志里的启动行猜）。
+STATE_PATH = os.path.join(HERE, "mivoice.state")
 
 _log_fp = None
+_log_path = LOG_PATH     # 当前写入的日志文件（回归测试会重定向，别污染正式日志）
 _debug = False
+
+
+def set_log_path(path):
+    """把日志改写到别的文件。
+
+    🔴 回归测试专用：tests\\run_all.py 会调用它，把测试产生的日志
+    写进 mivoice_test.log —— 否则木木看正式日志时会看到一堆
+    「发送键已转换」之类的假记录，分不清哪条是真事。
+    """
+    global _log_fp, _log_path
+    try:
+        if _log_fp is not None:
+            _log_fp.close()
+    except Exception:
+        pass
+    _log_fp = None
+    _log_path = path
 
 
 def log(msg):
@@ -68,7 +92,7 @@ def log(msg):
     line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
     if _log_fp is None:
         try:
-            _log_fp = open(LOG_PATH, "a", encoding="utf-8")
+            _log_fp = open(_log_path, "a", encoding="utf-8")
         except Exception:
             return
     try:
@@ -101,11 +125,19 @@ WM_SYSKEYUP = 0x0105
 # ---- OK 键 -> 发送（Ctrl+Enter）相关 ----
 WH_KEYBOARD_LL = 13
 LLKHF_INJECTED = 0x10          # 本程序自己注入的事件带这个标志，必须放行防递归
+LLKHF_ALTDOWN = 0x20          # 事件发生时 Alt 正按着（自动重复的 F5 会带这个）
 VK_RETURN = 0x0D
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
 RIDEV_INPUTSINK = 0x00000100   # 窗口不在前台也收 WM_INPUT
 RID_INPUT = 0x10000003
 RIDI_DEVICENAME = 0x20000007
+# 🔴 v1.6 更正（此前判断错了，这里写清楚免得再被带偏）：
+#    RIDI_DEVICENAME 的**官方值就是 0x20000007**，低位那个 7 是常量本身，
+#    **不是**「名字索引」。别再按「扫 0..15 个索引」去理解它。
+#    （0x20000000 是 RIDI_DEVICEINFO，返回的是 RAWINPUTDEVINFO 结构，不是名字。）
+#    下面这个 BASE 只用于「多路尝试」：万一 0x20000007 这次读不出来，
+#    再逐个试别的低位值 —— 实测有些 HID 集合只有某个低位能读出名字。
+RIDI_DEVICENAME_BASE = 0x20000000
 RIM_TYPEKEYBOARD = 1
 GCS_COMPSTR = 0x0008
 
@@ -134,7 +166,9 @@ MOD_NOREPEAT = 0x4000
 HOTKEY_ID_QUIT = 0xB2
 
 # 单实例保护（命名互斥体）
-MUTEX_NAME = "Local\\MiVoice_SingleInstance_v1"
+# 允许用环境变量 MIVOICE_MUTEX 覆盖 —— 只给自动化测试用，
+# 平时不要设，否则会出现「开了两个实例同时抢键盘钩子」。
+MUTEX_NAME = os.environ.get("MIVOICE_MUTEX", "Local\\MiVoice_SingleInstance_v1")
 ERROR_ALREADY_EXISTS = 183
 
 SM_CXSMICON = 49
@@ -142,10 +176,22 @@ SM_CXSMICON = 49
 # 输入模拟
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
-VK_MENU = 0x12        # Alt
-VK_CONTROL = 0x11     # Ctrl
-VK_SHIFT = 0x10       # Shift
+KEYEVENTF_EXTENDEDKEY = 0x0001   # 扩展键（方向键/Home/Menu 等）必须带上，否则键位不对
+VK_MENU = 0x12        # Alt（通用）
+VK_CONTROL = 0x11     # Ctrl（通用）
+VK_SHIFT = 0x10       # Shift（通用）
+VK_LMENU = 0xA4       # 左 Alt —— Electron/Chromium 认这个才当「真按住」
+VK_LCONTROL = 0xA2    # 左 Ctrl
+VK_LSHIFT = 0xA0      # 左 Shift
 VK_F5 = 0x74
+
+# 修饰键必须带硬件扫描码，Chromium 靠它判断左右键并维持按住状态。
+# 只发 VK + wScan=0 时，Electron 会把它当成一次性的虚拟点按（表现为「只亮一下」）。
+SCAN_BY_VK = {
+    VK_MENU: 0x38, VK_LMENU: 0x38,
+    VK_CONTROL: 0x1D, VK_LCONTROL: 0x1D,
+    VK_SHIFT: 0x2A, VK_LSHIFT: 0x2A,
+}
 
 # 托盘图标字形（Segoe MDL2 Assets：E720 = Microphone）
 FONT_ICON = "Segoe MDL2 Assets"
@@ -599,7 +645,17 @@ DEFAULTS = {
         "ok_to_send": "1",            # 1 = 遥控器 OK 键（Enter）触发发送快捷键
         "send_keys": "ctrl+enter",    # 要发送的组合键，对应 WorkBuddy 的发送设置
         "ok_send_title": "WorkBuddy", # 只在前台窗口标题含此串时转换（空=任意窗口，危险）
-        "remote_active_ms": "15000",  # 遥控器最近多少毫秒内有活动才算「是遥控器按的」
+        # 哪个物理键触发发送。可以写 enter / space / f7 / up / volumeup /
+        # 0x74 …（用 tools\scan_remote_keys.py 查出遥控器各键的 vk 后填这里）
+        "send_key": "enter",
+        "remote_active_ms": "10000",  # 原始事件没等到时的兜底窗口：最近多少毫秒内
+                                      # 有遥控器活动，就认为这一下是遥控器按的
+        "send_fallback_ms": "30000", # 看门狗兜底窗口（专用）。Raw Input 迟迟不来时，
+                                      # 「最近 30 秒内用过遥控器」就算遥控器按的。
+                                      # 🔴 用它而不是 remote_active_ms：说话到按 OK 键
+                                      #    间隔经常超过 10 秒，窗口太紧会漏判。
+        "send_confirm_ms": "400",    # 吞掉发送键后，等多久去问 Raw Input「谁按的」
+        "hide_remote_f5": "1",        # 1 = 藏掉遥控器语音键(F5)，否则 WorkBuddy 会误判成组合键
         "hotkey_quit": "Ctrl+Shift+M",  # 退出热键（实测 Ctrl+Alt+M/V/O/Q/X/Z/L 已被占用）
         "autostart": "0",             # 开机自启（托盘菜单可切，会写回本文件）
     },
@@ -1163,10 +1219,80 @@ class WaveOutPlayer:
 # ===========================================================================
 # 8. 按键模拟（SendInput）+ 窗口聚焦
 # ===========================================================================
-VK_MAP = {"alt": VK_MENU, "ctrl": VK_CONTROL, "control": VK_CONTROL,
+VK_MAP = {"alt": VK_LMENU, "ctrl": VK_CONTROL, "control": VK_CONTROL,
           "shift": VK_SHIFT, "f5": VK_F5, "enter": VK_RETURN, "return": VK_RETURN,
           "win": VK_LWIN, "space": 0x20, "tab": 0x09, "esc": 0x1B}
-KEY_NAME = {0x11: "ctrl", 0x10: "shift", 0x12: "alt", 0x5B: "win"}
+KEY_NAME = {0x11: "ctrl", 0x10: "shift", 0x12: "alt", 0x5B: "win",
+            0xA4: "alt", 0xA2: "ctrl", 0xA0: "shift"}
+
+# ---- 「哪个键触发发送」的配置（把遥控器上任意一个键绑成发送键）----
+# 名称 -> VK。数字键/字母键/功能键/方向键都能写名字，写不出来就写 0x??。
+VK_ALIASES = {
+    "enter": 0x0D, "return": 0x0D, "kp_enter": 0x6E,
+    "space": 0x20, "tab": 0x09, "esc": 0x1B, "escape": 0x1B,
+    "backspace": 0x08, "bksp": 0x08, "delete": 0x2E, "del": 0x2E,
+    "insert": 0x2D, "home": 0x24, "end": 0x23,
+    "pageup": 0x21, "pgup": 0x21, "pagedown": 0x22, "pgdn": 0x22,
+    "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+    "menu": 0x5D, "apps": 0x5D, "appskey": 0x5D,
+    "volumeup": 0xAF, "volumedown": 0xAE, "mute": 0xAD,
+    "play": 0xB3, "playpause": 0xB3, "stop": 0xB2,
+    "next": 0xB0, "prev": 0xB1,
+    "browser_home": 0xAC, "browser_back": 0xA6,
+    "browser_forward": 0xA7, "browser_refresh": 0xA8,
+    "browser_stop": 0xA9, "browser_search": 0xAA,
+    "browser_favorites": 0xAB,
+}
+VK_LABELS = {
+    0x0D: "Enter 回车", 0x20: "空格", 0x09: "Tab", 0x1B: "Esc",
+    0x25: "左方向键", 0x26: "上方向键", 0x27: "右方向键", 0x28: "下方向键",
+    0x5D: "菜单键", 0x6E: "小键盘 Enter",
+    0xAD: "静音", 0xAE: "音量-", 0xAF: "音量+",
+    0xB0: "下一曲", 0xB1: "上一曲", 0xB2: "停止", 0xB3: "播放/暂停",
+    0xAC: "浏览器主页",
+}
+
+
+def parse_vk_spec(spec):
+    """把「发送键」的配置值解析成 VK 码。解析不出来返回 None。
+
+    支持：enter / space / tab / f1..f12 / a..z / 0..9 / up / down / left /
+    right / home / end / volumeup / ... 以及 0x?? 十六进制。
+    """
+    s = str(spec or "").strip().lower()
+    if not s:
+        return None
+    if s.startswith("0x"):
+        try:
+            v = int(s, 16)
+            return v if 0 < v < 0x10000 else None
+        except ValueError:
+            return None
+    if s in VK_ALIASES:
+        return VK_ALIASES[s]
+    if s.startswith("f") and s[1:].isdigit():
+        n = int(s[1:])
+        if 1 <= n <= 24:
+            return 0x6F + n
+    if len(s) == 1:
+        if "0" <= s <= "9":
+            return ord(s)
+        if "a" <= s <= "z":
+            return ord(s.upper())          # 键名统一按大写字母处理
+    return None
+
+
+def vk_label(vk):
+    """VK 码 -> 好读的名字（用在提示文字里）。"""
+    if vk in VK_LABELS:
+        return VK_LABELS[vk]
+    if 0x70 <= vk <= 0x87:
+        return "F%d" % (vk - 0x6F)
+    if 0x30 <= vk <= 0x39:
+        return "数字 %d" % (vk - 0x30)
+    if 0x41 <= vk <= 0x5A:
+        return "字母 %s" % chr(vk)
+    return "VK 0x%02X" % vk
 
 
 def parse_combo(spec: str):
@@ -1207,29 +1333,34 @@ class KeySender:
     def __init__(self):
         self._held = set()
 
+    def _send_key(self, vk: int, flags: int):
+        """发送单个按键事件。修饰键自动附带硬件扫描码。
+
+        这是本程序的关键细节：Electron/Chromium 判断「Alt 是否一直按着」时
+        需要 wScan 非零，否则会当成一次性虚拟点按，导致 WorkBuddy 的语音
+        输入「只绿一下就停」。
+        """
+        inp = INPUT()
+        inp.type = INPUT_KEYBOARD
+        inp.ki = KEYBDINPUT(vk, SCAN_BY_VK.get(vk, 0), flags, 0, None)
+        if user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) != 1:
+            raise OSError("SendInput 失败 err=%s" % ctypes.get_last_error())
+
     def down(self, name: str):
-        vk = VK_MAP.get(name.strip().lower(), VK_MENU)
+        vk = VK_MAP.get(name.strip().lower(), VK_LMENU)
         if vk in self._held:
             return
-        inp = INPUT()
-        inp.type = INPUT_KEYBOARD
-        inp.ki = KEYBDINPUT(vk, 0, 0, 0, None)
-        if user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) != 1:
-            raise OSError("SendInput 失败 err=%s" % ctypes.get_last_error())
+        self._send_key(vk, 0)
         self._held.add(vk)
-        dbg("key down 0x%02X" % vk)
+        dbg("key down 0x%02X scan=0x%02X" % (vk, SCAN_BY_VK.get(vk, 0)))
 
     def up(self, name: str):
-        vk = VK_MAP.get(name.strip().lower(), VK_MENU)
+        vk = VK_MAP.get(name.strip().lower(), VK_LMENU)
         if vk not in self._held:
             return
-        inp = INPUT()
-        inp.type = INPUT_KEYBOARD
-        inp.ki = KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, None)
-        if user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) != 1:
-            raise OSError("SendInput 失败 err=%s" % ctypes.get_last_error())
+        self._send_key(vk, KEYEVENTF_KEYUP)
         self._held.discard(vk)
-        dbg("key up 0x%02X" % vk)
+        dbg("key up 0x%02X scan=0x%02X" % (vk, SCAN_BY_VK.get(vk, 0)))
 
     def tap(self, name: str, hold_ms: int = 60):
         self.down(name)
@@ -1242,11 +1373,32 @@ class KeySender:
         arr = (INPUT * len(seq))()
         for i, (vk, is_up) in enumerate(seq):
             arr[i].type = INPUT_KEYBOARD
-            arr[i].ki = KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP if is_up else 0, 0, None)
+            arr[i].ki = KEYBDINPUT(vk, SCAN_BY_VK.get(vk, 0),
+                                   KEYEVENTF_KEYUP if is_up else 0, 0, None)
         n = user32.SendInput(len(seq), arr, ctypes.sizeof(INPUT))
         if n != len(seq):
             raise OSError("SendInput 组合键失败 err=%s" % ctypes.get_last_error())
         dbg("combo %s sent (%d 个事件)" % (spec, len(seq)))
+        return True
+
+    def replay_key(self, vk: int, scan: int = 0, extended: bool = False):
+        """把「被我们吞掉的按键」原样补发回去。
+
+        用在「先吞掉 -> 异步确认 -> 发现不是遥控器」这条路上：
+        实体键盘的 Enter 被误吞后必须补回来，否则用户会「敲了回车没反应」。
+        补发的是注入事件（带 LLKHF_INJECTED），本程序自己的钩子会放行，不会递归。
+        """
+        arr = (INPUT * 2)()
+        for i, is_up in enumerate((False, True)):
+            arr[i].type = INPUT_KEYBOARD
+            flags = KEYEVENTF_KEYUP if is_up else 0
+            if extended:
+                flags |= KEYEVENTF_EXTENDEDKEY
+            arr[i].ki = KEYBDINPUT(vk, scan, flags, 0, None)
+        n = user32.SendInput(2, arr, ctypes.sizeof(INPUT))
+        if n != 2:
+            raise OSError("SendInput 补发按键失败 err=%s" % ctypes.get_last_error())
+        dbg("replay vk=0x%02X scan=0x%02X ext=%s" % (vk, scan, extended))
         return True
 
     def release_all(self):
@@ -1329,13 +1481,21 @@ class RemoteInputWatcher:
     活动时间」——钩子再据此判断某个 Enter 是不是遥控器发的。
     """
 
-    def __init__(self, hwnd, match: str = "2717", on_activity=None):
+    def __init__(self, hwnd, match: str = "2717", on_activity=None,
+                 on_keydown=None):
         self.hwnd = hwnd
         self.match = (match or "").strip().lower()
         self.on_activity = on_activity
+        self.on_keydown = on_keydown
         self.last_activity = 0.0
         self._dev_cache = {}
         self._seen = set()
+        # 🔴 v1.6：读不出设备名的 hDevice（只提醒一次，别刷屏）
+        self._unreadable = set()
+        # 🔴 v1.6：已经确认过「是遥控器」的 hDevice -> 名字读不出来时也能认
+        self._remote_hdevs = set()
+        # 🔴 v1.6：最近一次**实体键盘**按发送键的时刻（看门狗兜底判据用）
+        self.last_send_other_ts = 0.0
         self.registered = False
 
     def register(self) -> bool:
@@ -1350,26 +1510,98 @@ class RemoteInputWatcher:
             log("Raw Input 已注册（键盘，INPUTSINK）")
         return self.registered
 
+    def _read_names(self, hdev):
+        """真的去 Win32 问一遍这个 hDevice 有哪些顶层集合名。
+
+        拆出来是为了**能单测**：缓存逻辑（device_name）和系统调用
+        （_read_names）分开，测试只要打桩 _read_names 就能锁死
+        「读失败不许缓存」这条规则，不用真的插设备。
+        """
+        names = []
+        for idx in list(range(16)) + [0x07]:
+            cmd = RIDI_DEVICENAME_BASE | idx
+            size = wt.UINT(0)
+            user32.GetRawInputDeviceInfoW(wt.HANDLE(hdev), cmd, None,
+                                          ctypes.byref(size))
+            if not size.value:
+                continue
+            buf = ctypes.create_unicode_buffer(size.value + 1)
+            if user32.GetRawInputDeviceInfoW(wt.HANDLE(hdev), cmd, buf,
+                                             ctypes.byref(size)):
+                nm = buf.value
+                # 只收像设备路径的名字（\\?\HID#... / \\?\hid#...），
+                # 免得把索引越界时返回的垃圾当成真名字
+                if nm and nm.lower().startswith("\\\\?\\") and nm not in names:
+                    names.append(nm)
+        return names
+
     def device_name(self, hdev) -> str:
+        """读这个 hDevice 的设备路径（名字），**带缓存**。
+
+        🔴🔴🔴 【v1.6 关键修复·本次的真根因】**读不到名字时绝对不能缓存！**
+
+        知识点：`GetRawInputDeviceInfoW` 的 `uiCommand` 低位在
+        `RIDI_DEVICENAME`（=0x20000007）之外还能带**集合序号**，
+        一个物理 HID 设备可以有**多个顶层集合**（键盘 / 消费键 / 厂商自定义…），
+        每个集合是**独立的 hDevice**。所以这里**多路尝试**哪个能读出就用哪个。
+
+        ⚠️ 实测（本机 2026-10-30）：**读名字会偶发失败返回空串**。
+        典型场景 = 蓝牙设备刚重连、新 HID 集合刚枚举出来，路径还没准备好。
+
+        🔴 v1.5 的致命 bug（已修）：老代码最后一句无条件
+            `self._dev_cache[hdev] = name`
+        把**空串也缓存了** —— 于是「第一次读失败」会让这个 hDevice
+        **永远**返回空名，`is_remote()` 只能静默判 False ->
+        遥控器的 OK 键被当成实体键盘回车补发出去，**永远发不出去**。
+
+        ✅ v1.6：**只有读到非空名字才写缓存**；读不到就返回空串且**不缓存**，
+        下一次这个设备的任何按键事件都会自动重试 —— 蓝牙稳定后就能读出来，
+        判定自动恢复正常。
+
+        证据（v1.5 日志 17:45:02）：
+            Raw 其它设备按下发送键 vk=0x0D -> 不是遥控器，原样补发
+        这一行**前面没有**「Raw Input 键盘设备: ...」—— 因为名字是空的，
+        老代码静默 return False，连设备行都不打。
+        """
         if hdev in self._dev_cache:
             return self._dev_cache[hdev]
-        size = wt.UINT(0)
-        user32.GetRawInputDeviceInfoW(wt.HANDLE(hdev), RIDI_DEVICENAME, None,
-                                      ctypes.byref(size))
-        name = ""
-        if size.value:
-            buf = ctypes.create_unicode_buffer(size.value + 1)
-            if user32.GetRawInputDeviceInfoW(wt.HANDLE(hdev), RIDI_DEVICENAME, buf,
-                                             ctypes.byref(size)):
-                name = buf.value
-        self._dev_cache[hdev] = name
+        names = self._read_names(hdev)
+        name = names[0] if names else ""
+        if name:
+            # ✅ 只有读到真名字才缓存
+            self._dev_cache[hdev] = name
+            if hdev in self._unreadable:
+                # 之前读不出来，现在读出来了 —— 说明是「刚重连还没准备好」，
+                # 记一笔，让木木知道已经自动恢复正常。
+                self._unreadable.discard(hdev)
+                log("Raw 设备名后来读出来了 hdev=%s -> %s（之前是读不出来的，"
+                    "已自动恢复）" % (hdev, name[:100]))
+        else:
+            # 🔴 读不到 -> **不缓存**，下次事件自动重试
+            dbg("设备名暂时读不出来 hdev=%s（不缓存，下次事件重试）" % hdev)
+        if len(names) > 1:
+            dbg("设备 %s 有 %d 个顶层集合名" % (name[:40], len(names)))
         return name
 
     def is_remote(self, hdev) -> bool:
+        # ⚡ 快速通道：已经确认过是遥控器的 hDevice 直接认。
+        #    蓝牙重连会产生新的 hDevice，名字又可能读不出来 ——
+        #    但只要历史上认过一次同一个 hDevice，就不用再赌名字了。
+        if hdev in self._remote_hdevs:
+            return True
         name = self.device_name(hdev).lower()
         if not name:
+            # 🔴 读不到名字不等于「不是遥控器」—— 但也不能瞎猜。
+            #    这里明确记一笔，避免又出现「静默判错、查无实据」的情况。
+            if hdev not in self._unreadable:
+                self._unreadable.add(hdev)
+                log("Raw 设备名读不出来 hdev=%s -> 无法判定设备，"
+                    "按「非遥控器」处理（如遥控器 OK 键发不出去，先看这里）"
+                    % hdev)
             return False
         hit = ("vid&01" + self.match) in name or ("vid_" + self.match) in name
+        if hit:
+            self._remote_hdevs.add(hdev)
         if hdev not in self._seen:
             self._seen.add(hdev)
             log("Raw Input 键盘设备: %s -> %s"
@@ -1392,7 +1624,10 @@ class RemoteInputWatcher:
             if struct_unpack_i(raw, 0) != RIM_TYPEKEYBOARD:
                 return False
             hdev = struct_unpack_q(raw, 8)
-            msg = struct_unpack_i(raw, 32)
+            # 🔴 MakeCode / VKey 都是 USHORT，必须读 2 字节（详见 struct_unpack_h）
+            makecode = struct_unpack_h(raw, 24)     # RAWKEYBOARD.MakeCode
+            vkey = struct_unpack_h(raw, 30)         # RAWKEYBOARD.VKey
+            msg = struct_unpack_i(raw, 32)          # RAWKEYBOARD.Message
             if msg not in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 return False
             hit = self.is_remote(hdev)
@@ -1403,6 +1638,12 @@ class RemoteInputWatcher:
                         self.on_activity()
                     except Exception:
                         pass
+            # 把「这一下是哪个设备按的」告诉仲裁器 —— 只有这里能分清设备
+            if self.on_keydown:
+                try:
+                    self.on_keydown(vkey, makecode, hit)
+                except Exception:
+                    pass
             return hit
         except Exception as e:
             dbg("WM_INPUT 解析异常: %r" % (e,))
@@ -1413,17 +1654,230 @@ def struct_unpack_i(buf, off):
     return int.from_bytes(buf[off:off + 4], "little", signed=False)
 
 
+def struct_unpack_h(buf, off):
+    """读 2 字节无符号整数（USHORT）。
+
+    🔴 为什么必须有这个（踩过的坑）：
+    RAWKEYBOARD 里的 MakeCode 和 VKey 都是 **USHORT（2 字节）**，不是 DWORD。
+    用 struct_unpack_i（4 字节）去读 VKey，会把紧跟其后的 Message 的高 2 字节
+    一起吃进来，VKey=0x0D 会变成 0x0100000D —— 于是
+    `vkey != send_key_vk` 永远成立，Raw Input 的设备判定**一次都进不去**，
+    「遥控器 OK 键 -> Ctrl+Enter」就永远不生效。
+    """
+    return int.from_bytes(buf[off:off + 2], "little", signed=False)
+
+
 def struct_unpack_q(buf, off):
     return int.from_bytes(buf[off:off + 8], "little", signed=False)
 
 
+class SendArbiter:
+    """发送键仲裁器：把遥控器的 OK 键变成发送快捷键，同时绝不误伤实体键盘。
+
+    🔴 为什么必须有仲裁器（这是 v1.3 一直不生效的**根本原因**）：
+
+      1. 低级键盘钩子（WH_KEYBOARD_LL）是**同步先跑**的；
+         Raw Input 的 WM_INPUT 是**异步后处理**的。
+      2. 遥控器的 OK 键在 Windows 上就是一个**普通 Enter**
+         （实测 vk=0x0D, scan=0x1C, flags=0x00），跟实体键盘的 Enter
+         **完全同码** —— 钩子里只看 vk / scan / flags **分不出是谁按的**，
+         只有 Raw Input 的 hDevice 能分。
+      3. 于是 v1.3 用的「遥控器最近 3000ms 内活动过」这种时间窗判据，
+         在「按下 OK 键的这一刻」必然是**过期**的（这一下自己的 Raw Input
+         还没被处理），所以**第一次按 OK 键 100% 不转换**。
+
+    现在的做法（先吞 -> 异步按设备确认 -> 不对就补发）：
+
+      1. 钩子（同步）：命中发送键 + 前置条件满足
+         （前台窗口是 WorkBuddy / 没有修饰键按着 / 输入法没在组词）
+         -> **先吞掉**这一下，同时登记一条 pending；
+      2. Raw Input（异步）：同一 vk 的原始事件到了，看 hDevice 是不是遥控器
+         - 是遥控器 -> 发 send_keys（默认 ctrl+enter），pending 结算；
+         - 不是    -> 把刚才吞掉的按键**原样补发**回去（用户只晚几毫秒，
+                     完全无感），pending 结算；
+      3. 看门狗：pending 超过 confirm_ms 还没等到 Raw Input
+         -> 说明这次吞键把原始事件也挡住了，退而求其次：
+            最近一次原始键盘事件来自遥控器 -> 当成遥控器按的（转换）；
+            否则 -> 补发回去。
+
+    ⚠️ 补发（replay）是安全网的关键：宁可「晚 10ms 送达」，
+       也不能让用户的回车凭空消失。
+    """
+
+    MAX_PENDING = 16
+    # 🔴 v1.6：「keyup 没来」时的兜底阈值（秒）。
+    #    **权威的「按住周期结束」标志是 keyup** —— 系统的自动重复**不产生 keyup**，
+    #    而人的两次独立按键**一定产生 keyup**。所以 keyup 才是可靠判据，
+    #    这个阈值只用来兜底「keyup 事件丢失」（例如程序刚启动时按键已经按着）。
+    #    取 300ms：远大于系统最快重复速率（约 33ms/次），
+    #    也远小于人「松开再按」的正常间隔（>100ms）。
+    REPEAT_GAP = 0.300
+
+    def __init__(self, app):
+        self.app = app
+        self._lock = threading.Lock()
+        self._pending = []          # FIFO：每条 = 一次「被吞掉的发送键」
+        self._up_vk = 0             # 需要把抬起也吞掉的那个 vk
+        self._cycle_vk = 0          # 本次「按住周期」正在吞的 vk
+        self._cycle_ts = 0.0        # 本周期最后一次 down 的时刻
+        self.stats = {"sent": 0, "replayed": 0, "timeout": 0, "dropped": 0,
+                      "repeat": 0}
+
+    # ---------------- 钩子侧（同步，必须快：不写日志、不阻塞） ----------------
+    def on_hook_down(self, kb) -> bool:
+        """钩子收到发送键 keydown。返回 True = 吞掉这一下。
+
+        🔴 v1.6 关键修复：**按住不放不能连发！**
+
+        旧版每来一次 keydown 就新增一条 pending。系统按住不放会自动重复
+        产生几十次/秒的 keydown，于是 pending 堆成 6 条，Raw Input 也来 6 次，
+        结果就是**一次按住连发 6 次 ctrl+enter**（v1.5 日志 17:32:49 / 17:36:03
+        连续 6 条「发送键已转换（来源 raw）」就是现场）。
+
+        更糟的是：看门狗和 Raw Input 各结算一部分 pending，会导致
+        **同一次按键既转换又补发**（双发）—— v1.5 日志 17:45:02 先
+        「发送键已转换（来源 timeout）」又「补发原键（来源 raw）」。
+
+        ✅ v1.6：**一次「按下-松开」只对应一条 pending**。
+        自动重复的 keydown 照吞（不能让真实回车漏到前台程序），
+        但不再新增 pending —— 这样无论 Raw Input 来几次，最终只发一次。
+
+        ⚠️ 怎么区分「按住不放的自动重复」和「松开后再按一次」？
+           **靠 keyup**：系统的自动重复**不产生 keyup**，人的两次独立按键
+           **一定产生 keyup**。所以：
+             · on_hook_up  -> 清掉 _cycle_vk（本次按住周期结束）
+             · on_hook_down -> 若 _cycle_vk 仍是同一个 vk，就是自动重复
+           时间阈值 REPEAT_GAP 只兜底「keyup 丢失」，不是主要判据。
+        """
+        try:
+            if not self.app.ok_precheck():
+                return False
+            now = time.time()
+            with self._lock:
+                vk = kb.vkCode
+                if (self._cycle_vk == vk
+                        and (now - self._cycle_ts) < self.REPEAT_GAP):
+                    # 自动重复：吞掉，但**不新增 pending**
+                    self.stats["repeat"] += 1
+                    self._cycle_ts = now
+                    self._up_vk = vk
+                    return True
+                self._cycle_vk = vk
+                self._cycle_ts = now
+                self._pending.append({
+                    "vk": vk,
+                    "scan": kb.scanCode,
+                    "ext": bool(kb.flags & 0x01),   # LLKHF_EXTENDED
+                    "ts": now,
+                    "done": False,
+                })
+                if len(self._pending) > self.MAX_PENDING:
+                    del self._pending[0]
+                self._up_vk = vk
+            return True
+        except Exception:
+            return False
+
+    def on_hook_up(self, kb) -> bool:
+        """钩子收到发送键 keyup。返回 True = 吞掉这一下（跟吞掉的 down 配对）。"""
+        try:
+            with self._lock:
+                if self._up_vk == kb.vkCode:
+                    self._up_vk = 0
+                    self._cycle_vk = 0       # 本次按住周期结束
+                    return True
+            return False
+        except Exception:
+            return False
+
+    # ---------------- Raw Input 侧（异步，主线程） ----------------
+    def on_raw_keydown(self, vkey: int, makecode: int, is_remote: bool) -> bool:
+        """原始键盘事件到了。返回 True = 这次事件被仲裁器消费了。"""
+        try:
+            if vkey != self.app.send_key_vk:
+                return False
+            with self._lock:
+                pend = None
+                for p in self._pending:
+                    if not p["done"]:
+                        pend = p
+                        break
+                if pend is None:
+                    # 没有 pending -> 这一下我们没吞（前置条件不满足），原样放行
+                    return False
+                pend["done"] = True
+            if is_remote:
+                self._do_send("raw")
+            else:
+                self._do_replay(pend, "raw")
+            return True
+        except Exception:
+            return False
+
+    # ---------------- 看门狗（主线程定时器） ----------------
+    def tick(self):
+        """检查有没有 pending 超时（没等到 Raw Input）。"""
+        try:
+            now = time.time()
+            limit = self.app.send_confirm_ms / 1000.0
+            overdue = []
+            with self._lock:
+                for p in self._pending:
+                    if not p["done"] and (now - p["ts"]) > limit:
+                        p["done"] = True
+                        overdue.append(p)
+                if len(self._pending) > self.MAX_PENDING:
+                    self._pending = [p for p in self._pending if not p["done"]][-4:]
+            for p in overdue:
+                self.stats["timeout"] += 1
+                if self.app.remote_recently():
+                    # 没等到原始事件，但最近的活动确实来自遥控器 -> 当成遥控器按的
+                    log("看门狗兜底：等不到 Raw Input，按「遥控器」处理 -> 发 %s"
+                        % self.app.send_spec)
+                    self._do_send("timeout")
+                else:
+                    log("看门狗兜底：等不到 Raw Input，按「实体键盘」处理 -> 补发原键")
+                    self._do_replay(p, "timeout")
+        except Exception:
+            pass
+
+    # ---------------- 落地动作 ----------------
+    def _do_send(self, via: str):
+        try:
+            self.app.keys.send_combo(self.app.send_spec)
+            self.app.ok_send_count += 1
+            self.stats["sent"] += 1
+            log("发送键已转换：%s -> %s（来源 %s）"
+                % (self.app.send_key_name, self.app.send_spec, via))
+        except Exception as e:
+            log("发送键转换失败: %r" % (e,))
+
+    def _do_replay(self, pend: dict, via: str):
+        try:
+            self.app.keys.replay_key(pend["vk"], pend["scan"], pend["ext"])
+            self.stats["replayed"] += 1
+            log("补发原键 vk=0x%02X（来源 %s，判定为非遥控器）"
+                % (pend["vk"], via))
+        except Exception as e:
+            # 补发都失败了 -> 这下回车是真的丢了，记一笔别装没发生
+            self.stats["dropped"] += 1
+            log("！！补发按键失败，用户这一下回车可能丢了: %r" % (e,))
+
+
 class EnterSendHook:
-    """低级键盘钩子：把「遥控器的 Enter」变成「发送快捷键」（默认 Ctrl+Enter）。
+    """低级键盘钩子，做两件事：
+
+    1) **吞掉遥控器语音键(F5)的自动重复**（防止 WorkBuddy 误判成组合键）
+       —— 这是「语音图标只绿一下就停」的根因，详见 _handle_f5()。
+    2) 把「遥控器的发送键」变成「发送快捷键」（默认 Ctrl+Enter）。
+       发送键本身可在 mivoice.ini 的 `send_key` 里改（enter / space / f7 /
+       up / volumeup / 0x74 …），用 tools\\scan_remote_keys.py 可以查出
+       遥控器每个键对应的 vk。
 
     判定链（任何一条不满足就原样放行）：
       1. 总开关 ok_to_send + 程序未暂停
       2. 前台窗口标题匹配（默认 WorkBuddy）
-      3. 遥控器最近有活动（Raw Input 记录，默认 15 秒内）
+      3. 遥控器最近有活动（Raw Input 记录，默认 3 秒内）
       4. 输入法没有在组词（否则 Enter 要留给输入法选词）
       5. 当前没有任何修饰键按下（用户自己按 Ctrl+Enter 时不干预）
       6. 事件不是本程序注入的（LLKHF_INJECTED，防递归）
@@ -1442,6 +1896,14 @@ class EnterSendHook:
         self._ready = threading.Event()
         self._swallow_up = False     # 这一下 keydown 被我吞了，配对的 keyup 也要吞
         self._last_convert = 0.0     # 防长按自动重复连发
+        # F5 拦截的三态机（见 _handle_f5）
+        #   0 = 没有 F5 按着
+        #   1 = 本轮按下的第一次 down 放行了 -> 抬起来也必须放行（配对）
+        #   2 = 本轮按下的第一次 down 吞掉了 -> 后续重复 + 抬起全部吞掉
+        self._f5_state = 0
+        # 修饰键自跟踪：钩子能看到每一个按键事件，比 GetAsyncKeyState 可靠
+        #（异步键状态是「按线程」维护的，别的线程读出来可能是 0）。
+        self._mods = set()
 
     def install(self) -> bool:
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -1474,34 +1936,160 @@ class EnterSendHook:
             pass
         self.hook = None
 
+    # 修饰键集合（含左右各版本）。用于判断「用户是不是自己按着组合键」。
+    MODIFIER_VKS = frozenset((0x10, 0x11, 0x12,
+                              0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+                              0x5B, 0x5C))
+
+    def _track_modifier(self, wParam, kb):
+        """跟踪当前按着的修饰键。
+
+        钩子能看到系统里**每一个**按键事件（包括我们程序自己注入的 Alt），
+        所以这里维护出来的状态就是「此刻屏幕上真正按着的修饰键」。
+        """
+        vk = kb.vkCode
+        if vk not in self.MODIFIER_VKS:
+            return
+        if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+            self._mods.add(vk)
+        elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+            self._mods.discard(vk)
+
+    def mods_down(self) -> bool:
+        """此刻有没有修饰键按着。"""
+        return bool(self._mods)
+
     def _on_key(self, nCode, wParam, lParam):
         """钩子回调：只做内存判断 + SendInput，不写日志、不调阻塞 API。"""
         try:
             if nCode == 0:
                 kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                if kb.vkCode == VK_RETURN and not (kb.flags & LLKHF_INJECTED):
+                self._track_modifier(wParam, kb)
+                tag = ""
+                swallowed = self._handle_f5(wParam, kb)
+                if swallowed:
+                    tag = "SWAL"
+                # 发送键交给仲裁器：先吞掉，等 Raw Input 告诉我是谁按的
+                elif (self.app.arbiter is not None
+                        and kb.vkCode == self.app.send_key_vk
+                        and not (kb.flags & LLKHF_INJECTED)):
                     if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                        # 长按会触发系统自动重复：350ms 内只转一次
-                        if time.time() - self._last_convert < 0.35:
-                            return 1
-                        if self.app.ok_should_send():
-                            self.app.keys.send_combo(self.app.send_spec)
-                            self._swallow_up = True
-                            self._last_convert = time.time()
-                            return 1                  # 吞掉原来的 Enter
+                        swallowed = self.app.arbiter.on_hook_down(kb)
                     elif wParam in (WM_KEYUP, WM_SYSKEYUP):
-                        if self._swallow_up:
-                            self._swallow_up = False
-                            return 1                  # 吞掉配对的抬起，防残留状态
+                        swallowed = self.app.arbiter.on_hook_up(kb)
+                    if swallowed:
+                        tag = "SND"
+                self._record_key(wParam, kb, swallowed, tag)
+                if swallowed:
+                    return 1
         except Exception:
             pass
         return user32.CallNextHookEx(self.hook, nCode, wParam, lParam)
+
+    # ---- 遥控器语音键(F5)拦截 ----
+    def _handle_f5(self, wParam, kb) -> bool:
+        """在 WorkBuddy 录音期间把遥控器的 F5 整个吞掉。返回 True=吞掉。
+
+        🔴 为什么必须吞（这是「语音图标只绿一下就停」的根因）：
+        遥控器的「语音键」在 Windows 上就是一个 **F5**。按住不放时，系统会自动
+        重复产生几十次/秒的 keydown。而 WorkBuddy 的语音热键逻辑是：
+
+            if (!isVoiceModifierKey(e, 'Alt')) {         // 收到非修饰键
+                e.phase === 'down' && n                  //   且 Alt 正按着
+                  ? (i = true, r && stop())              //   -> 判定成「组合键」-> 停止录音
+                  : ...
+                return;
+            }
+
+        它**不检查 e.repeat**，所以系统的自动重复照样命中「组合键」判定：
+        刚 hold-start 录音就立刻被自己的自动重复掐断（表现：图标只绿一下）。
+        唯一稳妥的解法是让 WorkBuddy 根本收不到 F5 —— 也就是在这里吞掉。
+
+        ⚠️ 配对原则：down 吞了 up 也必须吞；down 放行了 up 也要放行，
+        否则别的程序会收到「有抬起没按下」，键盘状态就错乱了。
+        """
+        if kb.vkCode != VK_F5 or (kb.flags & LLKHF_INJECTED):
+            return False
+        alt_down = bool(kb.flags & LLKHF_ALTDOWN)
+        if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+            if self._f5_state == 0:
+                # 本轮按下的第一次 down：决定这一轮吞不吞
+                block = self._f5_should_swallow(alt_down)
+                self._f5_state = 2 if block else 1
+                return block
+            # 自动重复：只要 Alt 正按着就吞 —— 这正是 WorkBuddy 判成组合键的条件
+            if self._f5_state == 2 or self._f5_should_swallow(alt_down):
+                return True
+            return False
+        if wParam in (WM_KEYUP, WM_SYSKEYUP):
+            # 抬起必须与按下配对：这一轮从头到尾吞了就吞抬起，放行过就放行抬起
+            block = (self._f5_state == 2)
+            self._f5_state = 0
+            return block
+        return False
+
+    def _f5_should_swallow(self, alt_down: bool) -> bool:
+        """这个 F5 事件要不要吞掉。
+
+        判据有两条，任意一条成立就吞：
+
+        1. **事件自带 LLKHF_ALTDOWN** —— Windows 明确告诉我们「这个事件发生
+           时 Alt 正按着」。这跟 WorkBuddy 内部那个 `n`（Alt 按住标志）
+           是同一个语义，是最准的判据，而且是**逐事件**的。
+           ⚠️ 别改用 GetAsyncKeyState 二次确认：它的异步键状态是**按线程**
+           维护的、随该线程取走键盘消息才刷新，而注入的按键被路由到前台
+           窗口线程，所以别的线程很可能永远读到 0（实测纯脚本线程恒为
+           0x0000，而 MiVoice 主线程却偶尔能读到 alt=3）。靠它做判据会
+           时灵时不灵，属于典型的「看运气」写法。
+        2. **voice_active** —— 我们正按住 Alt 模拟录音（ATVV 会话进行中）。
+
+        这样物理键盘的 F5（刷新）在平时完全不受影响。
+        """
+        app = self.app
+        if app is None:
+            return False
+        if not getattr(app, "hide_remote_f5", True):
+            return False
+        # 我们自己模拟的键如果正好是 F5（alt_key=f5），那 F5 是触发键不能吞
+        if getattr(app, "alt_key", "alt").strip().lower() == "f5":
+            return False
+        if alt_down:
+            return True
+        return bool(getattr(app, "voice_active", False))
 
     def uninstall(self):
         if self._tid:
             user32.PostThreadMessageW(self._tid, 0x0012, 0, 0)   # WM_QUIT
             self._tid = 0
         self._thread = None
+
+    # ---- 键盘事件取证（只写内存，由主线程定时落盘）----
+    def _record_key(self, wParam, kb, swallowed=False, tag=""):
+        """低级钩子里不能写文件（会卡住整个系统键盘）。
+
+        这里只把事件塞进内存列表，真正的落盘交给主线程的定时器。
+
+        tag 用来区分「为什么被吞」：
+          "SWAL" = 遥控器语音键 F5 被吞（防 WorkBuddy 误判组合键）
+          "SND"  = 发送键被仲裁器吞（等 Raw Input 确认设备归属）
+        """
+        try:
+            app = self.app
+            if app is None:
+                return
+            app._key_events.append((
+                time.time(),
+                wParam,
+                kb.vkCode,
+                kb.scanCode,
+                kb.flags,
+                swallowed,
+                tag,
+            ))
+            if len(app._key_events) > 4000:      # 防止无限增长
+                del app._key_events[:2000]
+        except Exception:
+            pass
 
 
 class ImeProbe(threading.Thread):
@@ -1637,6 +2225,12 @@ class Tray:
             shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
 
     def balloon(self, title, text):
+        """托盘气泡。
+
+        ⚠️ Windows 的气泡**不解析 \\n，而且宽度有限**，文字一长就被截断
+        （表现：说明只显示一半，后面没了）。所以气泡只放「一行短提示」，
+        完整说明走 msgbox()。
+        """
         self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO
         self.nid.szInfoTitle = title[:63]
         self.nid.szInfo = text[:255]
@@ -1644,6 +2238,18 @@ class Tray:
         if self.added:
             shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
         self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+
+    def msgbox(self, title, text):
+        """弹一个真正的对话框：支持换行、窗口自适应宽度，长说明用这个。"""
+        MB_OK = 0x00000000
+        MB_ICONINFORMATION = 0x00000040
+        MB_TOPMOST = 0x00040000
+        try:
+            user32.MessageBoxW(self.hwnd, text, title,
+                               MB_OK | MB_ICONINFORMATION | MB_TOPMOST)
+        except Exception as e:
+            log("MessageBox 失败: %r" % (e,))
+            self.balloon(title, text.replace("\r\n", " ")[:120])
 
     def remove(self):
         if self.added:
@@ -1700,6 +2306,7 @@ IDM_HELP = 2005
 IDM_QUIT = 2006
 IDM_SENDTEST = 2007
 IDM_RECONNECT = 2008
+IDM_SCANKEYS = 2009
 
 COLOR_IDLE = (0x00, 0xE6, 0x76)     # 亮绿：待命（深色任务栏上最醒目，且不与蓝色系系统图标混淆）
 COLOR_OFF = (0x90, 0x90, 0x90)      # 中灰：暂停
@@ -1727,20 +2334,44 @@ class App:
         self.ok_to_send = self.cfg.b("general", "ok_to_send")
         self.send_spec = self.cfg.s("general", "send_keys") or "ctrl+enter"
         self.ok_send_title = self.cfg.s("general", "ok_send_title") or ""
+        # 哪个物理键触发发送（默认 Enter）。填错了就退回 Enter，别让程序起不来。
+        self.send_key_spec = self.cfg.s("general", "send_key") or "enter"
+        self.send_key_vk = parse_vk_spec(self.send_key_spec)
+        if self.send_key_vk is None:
+            log("！！send_key=%r 解析不出来，退回 Enter"
+                % self.send_key_spec)
+            self.send_key_vk = VK_RETURN
+            self.send_key_spec = "enter"
+        self.send_key_name = vk_label(self.send_key_vk)
         self.remote_active_ms = self.cfg.i("general", "remote_active_ms")
+        # 看门狗兜底窗口：Raw Input 没在 send_confirm_ms 内到达时，
+        # 「最近 send_fallback_ms 毫秒内用过遥控器」就当成遥控器按的。
+        self.send_fallback_ms = max(1000, self.cfg.i("general", "send_fallback_ms"))
+        # 吞掉发送键之后，等多久去问 Raw Input「这一下到底是谁按的」。
+        # 超时了就按「最近活动来自遥控器」兜底，并补发原键。
+        self.send_confirm_ms = max(50, self.cfg.i("general", "send_confirm_ms"))
+        # 1 = 录音期间吞掉遥控器的 F5（见 EnterSendHook._handle_f5）
+        # 根因：WorkBuddy 的 useVoiceAltHotkey 不检查 e.repeat，
+        # 遥控器语音键的自动重复会被判成「组合键」而立刻 stop。
+        self.hide_remote_f5 = self.cfg.b("general", "hide_remote_f5")
         self.host = None
         self.tray = None
         self.remote = None
         self.player = None
         self.keys = KeySender()
+        self._key_events = []      # 键盘事件取证缓冲区（钩子写、主线程落盘）
         self.remote_input = None     # RemoteInputWatcher
         self.enter_hook = None       # EnterSendHook
+        self.arbiter = None          # SendArbiter（发送键仲裁）
         self.ime_flag = False        # 输入法是否在组词（ImeProbe 线程维护）
         self.ime_probe = None
         self.ok_send_count = 0
+        self._last_f5_raw_log = 0.0     # 语音键原始事件的日志节流
+        self._last_other_raw_log = 0.0  # 其它设备按发送键的日志节流
         self._want_reconnect = False
         self._last_check_ts = 0.0    # 上次链路体检时间（节流用）
         self.state = "idle"          # idle | recording
+        self.voice_active = False    # 我们正按住 Alt 模拟录音（钩子据此吞掉 F5）
         self.sessions_ok = 0
         self.last_err = ""
         self._hicon_idle = None
@@ -1767,6 +2398,7 @@ class App:
         self._register_hotkey()
         self._refresh_tip()
         user32.SetTimer(self.host, 1, 1000, None)
+        self._write_state()
 
         # 音频输出设备（预热打开，降低首次延迟）
         self.player = WaveOutPlayer(self.cfg.s("general", "output_device"))
@@ -1793,27 +2425,38 @@ class App:
                 log("！！send_keys=%r 解析失败，OK 键发送不启用" % self.send_spec)
                 self.ok_to_send = False
         if self.ok_to_send:
+            self.arbiter = SendArbiter(self)
             self.remote_input = RemoteInputWatcher(
                 self.host, self.cfg.s("general", "device_match"),
-                on_activity=self._on_remote_activity)
+                on_activity=self._on_remote_activity,
+                on_keydown=self._on_raw_key)
             self.remote_input.register()
             self.ime_probe = ImeProbe(self)
             self.ime_probe.start()
-            self.enter_hook = EnterSendHook(self)
-            self.enter_hook.install()
-            log("OK 键发送已启用：Enter -> %s（仅前台窗口含 %r 且遥控器 %dms 内活动过）"
-                % (self.send_spec, self.ok_send_title or "<任意>",
-                   self.remote_active_ms))
+            log("OK 键发送已启用：%s -> %s（仅前台窗口含 %r；"
+                "设备归属由 Raw Input 判定，%dms 内未确认则按最近活动兜底）"
+                % (self.send_key_name, self.send_spec,
+                   self.ok_send_title or "<任意>", self.send_confirm_ms))
 
-        # 欢迎提示（只在新装机时有用，简短一点）
+        # 键盘钩子：始终安装（与 ok_to_send 无关）
+        #   · 录音期间吞掉遥控器的 F5 —— 不然 WorkBuddy 会把它当成
+        #     「按住 Alt 时的组合键」，刚开录就停止（只绿一下就没了）
+        #   · ok_to_send 打开时，顺便把 Enter 转成发送快捷键
+        self.enter_hook = EnterSendHook(self)
+        self.enter_hook.install()
+
+        # 欢迎提示。⚠️ 托盘气泡不换行、宽度有限，长说明会被截断，
+        # 所以这里只放一行短提示，完整说明在托盘菜单「使用说明」里。
         if self.tray:
             self.tray.balloon(
-                "%s v%s" % (APP_NAME, APP_VER),
-                "用法：点进 WorkBuddy 输入框 → 按住遥控器语音键说话 → 松手出字，"
-                "按 OK 键发送。\n若没反应：看托盘菜单「使用说明」。")
+                "%s v%s 已就绪" % (APP_NAME, APP_VER),
+                "按住遥控器语音键说话，松手出字。")
 
         if self.args.selftest:
             user32.SetTimer(self.host, 2, max(1, self.args.selftest) * 1000, None)
+        # 看门狗：100ms 一次，检查有没有「吞了但没等到 Raw Input 确认」的按键
+        if self.arbiter:
+            user32.SetTimer(self.host, 3, 100, None)
 
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -1821,6 +2464,30 @@ class App:
             user32.DispatchMessageW(ctypes.byref(msg))
         log("消息循环结束，清理中")
         self.cleanup()
+
+    def _write_state(self):
+        """写下运行状态（版本 + PID + 启动时间），给排错脚本看。"""
+        try:
+            import json
+            data = {
+                "ver": APP_VER,
+                "pid": os.getpid(),
+                "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "send_key": self.send_key_spec,
+                "send_keys": self.send_spec,
+                "ok_to_send": bool(self.ok_to_send),
+            }
+            with open(STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            dbg("写状态文件失败: %r" % (e,))
+
+    def _clear_state(self):
+        try:
+            if os.path.exists(STATE_PATH):
+                os.remove(STATE_PATH)
+        except Exception:
+            pass
 
     def _make_icons(self):
         try:
@@ -1954,30 +2621,98 @@ class App:
             dbg("链路静默 %ds，接口已消失 —— 标记重连" % int(idle))
             self._want_reconnect = True
 
+    def _on_raw_key(self, vkey: int, makecode: int, is_remote: bool):
+        """Raw Input 的原始键盘事件 -> 交给仲裁器判定设备归属。
+
+        🔴 这里顺带打两条**正式日志**（不是 dbg），因为它们是判断
+        「钩子吞键到底会不会挡住原始事件」的唯一证据，必须在普通日志里能看见：
+          · 「Raw 遥控器按下发送键 vk=0x0D」-> 原始事件到了，设备归属明确，
+            走的是精确路径（来源 raw）；
+          · 「Raw 遥控器语音键 vk=0x74 到达（该键会被钩子吞掉）」-> 证明
+            **钩子吞键不影响 Raw Input**，仲裁器可以放心用设备归属判定。
+        两类都做了 1 秒节流，不然按住说话会刷屏。
+        """
+        try:
+            now = time.time()
+            # 🔴 v1.6：记下「最近一次实体键盘按发送键」的时刻 —— 看门狗兜底时
+            #    要用它区分「这次回车是键盘打的」还是「遥控器打的」。
+            if vkey == self.send_key_vk and not is_remote:
+                if self.remote_input:
+                    self.remote_input.last_send_other_ts = now
+            if is_remote:
+                if vkey == self.send_key_vk:
+                    log("Raw 遥控器按下发送键 vk=0x%02X -> 设备归属确认" % vkey)
+                elif vkey == VK_F5:
+                    if now - self._last_f5_raw_log > 1.0:
+                        self._last_f5_raw_log = now
+                        log("Raw 遥控器语音键 vk=0x%02X 到达（该键会被钩子吞掉）"
+                            % vkey)
+            elif vkey == self.send_key_vk:
+                # 别的设备按了发送键 —— 这是「原样补发回车」路径的证据。
+                # 节流 1 秒，否则木木用实体键盘打字时会刷屏。
+                if now - self._last_other_raw_log > 1.0:
+                    self._last_other_raw_log = now
+                    log("Raw 其它设备按下发送键 vk=0x%02X -> 不是遥控器，原样补发"
+                        % vkey)
+            if self.arbiter:
+                self.arbiter.on_raw_keydown(vkey, makecode, is_remote)
+        except Exception:
+            pass
+
     def _touch_remote(self):
         """兜底：语音会话开始/结束时也刷新遥控器活动时间（Raw Input 失败时靠它）。"""
         if self.remote_input:
             self.remote_input.last_activity = time.time()
 
-    def ok_should_send(self) -> bool:
-        """钩子里的判定：这个 Enter 要不要变成发送快捷键。"""
+    def ok_precheck(self) -> bool:
+        """钩子里的**前置条件**判定：这一下要不要进入「发送键仲裁」。
+
+        ⚠️ 这里**故意不查遥控器活动**！
+        遥控器的 OK 键在 Windows 上就是普通 Enter，钩子同步先跑的时候，
+        这一下自己的 Raw Input 还没到 —— 任何「最近活动过」的时间窗都会
+        **漏掉第一次按 OK**（这正是 v1.3 一直不生效的原因）。
+        设备归属交给异步的仲裁器用 Raw Input 去判。
+
+        判定链（任何一条不满足就原样放行，不吞）：
+          1. 总开关 ok_to_send + 程序未暂停
+          2. 前台窗口标题匹配（默认 WorkBuddy）
+          3. 输入法没有在组词（否则 Enter 要留给输入法选词）
+          4. 当前没有任何修饰键按下（用户自己按 Ctrl+Enter 时不干预）
+        """
         if not self.ok_to_send or not self.enabled:
             return False
         fg = user32.GetForegroundWindow()
         if not fg or not title_matches(fg, self.ok_send_title):
             return False
-        if self.remote_input:
-            age_ms = (time.time() - self.remote_input.last_activity) * 1000.0
-            if age_ms > self.remote_active_ms:
-                return False
-        else:
-            return False            # 没有 Raw Input 就不敢乱转（安全优先）
         if self.ime_flag:
             return False            # 输入法在组词，Enter 要留给它选词
-        for vk in (VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN):
-            if user32.GetAsyncKeyState(vk) & 0x8000:
-                return False        # 用户自己按着组合键，别掺和
-        self.ok_send_count += 1
+        if self.enter_hook is not None and self.enter_hook.mods_down():
+            return False            # 用户自己按着组合键，别掺和
+        return True
+
+    def remote_recently(self) -> bool:
+        """看门狗兜底判据：这次被吞掉的发送键，是不是遥控器按的？
+
+        这是「Raw Input 迟迟没到」时的兜底。
+
+        🔴 v1.6 判据收紧（之前只有一条太宽）：
+          1. 遥控器在 send_fallback_ms（默认 30 秒）窗口内有过活动
+             —— 必须宽，因为「说话 -> 松手 -> 按 OK 键」间隔经常超 10 秒；
+          2. **且**最近一次「实体键盘按发送键」不比遥控器活动更近
+             —— 木木用实体键盘敲回车打字时，别把它误当成遥控器。
+
+        ⚠️ 用「实体键盘**按发送键**」而不是「实体键盘有活动」：
+           木木打字用的是字母键，不该影响这个判定 —— 只看发送键本身。
+        """
+        ri = self.remote_input
+        if not ri:
+            return False
+        now = time.time()
+        age_ms = (now - ri.last_activity) * 1000.0
+        if age_ms > self.send_fallback_ms:
+            return False
+        if getattr(ri, "last_send_other_ts", 0.0) > ri.last_activity:
+            return False          # 实体键盘的回车比遥控器活动更近 -> 判为键盘
         return True
 
     def _on_begin(self):
@@ -1995,6 +2730,11 @@ class App:
                 log("已聚焦窗口：%s" % self.focus_title)
             else:
                 log("没找到标题含 %r 的窗口（不聚焦，用当前焦点）" % self.focus_title)
+        # 🔴 顺序很重要：voice_active 必须先于 Alt 按下就置位。
+        #    遥控器的 F5 按下后会立刻开始自动重复（每秒 30 次），
+        #    只要在按下 Alt 的那一瞬间没开始拦，WorkBuddy 就会收到
+        #    「按住 Alt 期间的其它键」-> 判定成组合键 -> 立刻停止录音。
+        self.voice_active = True
         try:
             if self.alt_mode == "tap":
                 self.keys.tap(self.alt_key, self.alt_tap_ms)
@@ -2004,6 +2744,7 @@ class App:
                     time.sleep(self.alt_pre_ms / 1000.0)
         except Exception as e:
             self.last_err = str(e)
+            self.voice_active = False
             log("触发按键失败: %r" % (e,))
             return
         self.state = "recording"
@@ -2035,6 +2776,8 @@ class App:
         except Exception as e:
             self.last_err = str(e)
             log("松开按键失败: %r" % (e,))
+        # Alt 已经松开，WorkBuddy 那边不会再收到非修饰键，收尾后再放开 F5 拦截
+        self.voice_active = False
         self.state = "idle"
         self.sessions_ok += 1
         self._post(1)
@@ -2043,6 +2786,41 @@ class App:
     def _post(self, code):
         if self.host:
             user32.PostMessageW(self.host, WM_APP_STATE, code, 0)
+
+    def _flush_key_events(self):
+        """把钩子采集到的键盘事件写到 mivoice_keys.log（主线程做，不阻塞钩子）。"""
+        try:
+            evs = self._key_events
+            if not evs:
+                return
+            self._key_events = []
+            kinds = {WM_KEYDOWN: "down", WM_KEYUP: "up",
+                     WM_SYSKEYDOWN: "sysdown", WM_SYSKEYUP: "sysup"}
+            alt = 0
+            try:
+                if user32.GetAsyncKeyState(VK_MENU) & 0x8000:
+                    alt |= 1
+                if user32.GetAsyncKeyState(VK_LMENU) & 0x8000:
+                    alt |= 2
+            except Exception:
+                pass
+            with open(KEYLOG_PATH, "a", encoding="utf-8") as f:
+                for ev in evs:
+                    ts, wparam, vk, scan, flags, swallowed = ev[:6]
+                    tag = ev[6] if len(ev) > 6 else ""
+                    kind = kinds.get(wparam, str(wparam))
+                    src = "INJ" if (flags & LLKHF_INJECTED) else "HW "
+                    if tag == "SND":
+                        src = "SND"          # 发送键被仲裁器吞，等设备归属确认
+                    elif tag == "SWAL" or swallowed:
+                        src = "SWAL"          # 被 MiVoice 拦下，没送到 WorkBuddy
+                    f.write("%s  %-7s vk=0x%02X scan=0x%02X flags=0x%X %s "
+                            "alt=%d state=%s\n"
+                            % (time.strftime("%H:%M:%S") + ".%03d"
+                               % int((ts % 1) * 1000),
+                               kind, vk, scan, flags, src, alt, self.state))
+        except Exception:
+            pass
 
 
     # ---------------- 托盘界面 ----------------
@@ -2090,6 +2868,8 @@ class App:
         user32.AppendMenuW(hmenu, MF_STRING, IDM_SENDTEST,
                            "测试发送（%s）" % self.send_spec)
         user32.AppendMenuW(hmenu, MF_STRING, IDM_RECONNECT, "重新连接遥控器")
+        user32.AppendMenuW(hmenu, MF_STRING, IDM_SCANKEYS,
+                           "扫描遥控器按键（查每个键是什么）")
         user32.AppendMenuW(hmenu, MF_STRING, IDM_AUTOSTART,
                            "关闭开机自启" if autostart_enabled() else "开启开机自启")
         user32.AppendMenuW(hmenu, MF_STRING, IDM_LOGFILE, "查看运行日志")
@@ -2126,6 +2906,8 @@ class App:
             log("手动重连遥控器")
             if self.tray:
                 self.tray.balloon(APP_NAME, "正在重新连接遥控器…（按一下语音键唤醒它）")
+        elif cmd == IDM_SCANKEYS:
+            self._scan_keys()
         elif cmd == IDM_AUTOSTART:
             on = not autostart_enabled()
             if autostart_set(on):
@@ -2145,16 +2927,61 @@ class App:
             user32.DestroyWindow(self.host)
 
     def _show_help(self):
-        self.tray.balloon(
-            "%s v%s 用法" % (APP_NAME, APP_VER),
-            "1. 先在 Windows 声音设置把默认录音设备设为 CABLE Output\n"
-            "2. 点进 WorkBuddy 输入框，按住遥控器语音键说话\n"
-            "3. 松手出字，按 OK 键发送（= %s）\n"
-            "注意：说话和发送时焦点要在 WorkBuddy 输入框\n"
-            "遥控器刚活动过（%d 秒内）OK 才会当发送；你在用实体键盘时"
-            "Enter 不受影响\n"
-            "退出热键：%s"
-            % (self.send_spec, max(1, self.remote_active_ms // 1000), self.quit_spec))
+        """完整用法说明。
+
+        原来用托盘气泡显示，气泡不换行又会被截断（一半字看不见），
+        改成 MessageBox —— 支持 \\r\\n 换行，窗口也会自适应大小。
+        """
+        text = (
+            "【%s v%s】\r\n"
+            "\r\n"
+            "1. Windows 声音设置里，把默认录音设备设为 CABLE Output\r\n"
+            "2. 点进 WorkBuddy 输入框，按住遥控器语音键说话\r\n"
+            "3. 松手出字；按遥控器的「%s」键发送（= %s）\r\n"
+            "\r\n"
+            "注意：\r\n"
+            "· 说话和发送时，焦点都要在 WorkBuddy 输入框\r\n"
+            "· 「%s」键只有在焦点窗口标题含「%s」时才会变成发送\r\n"
+            "· 实体键盘的 Enter 不受影响（只是会晚几毫秒送达）\r\n"
+            "· 退出热键：%s\r\n"
+            "\r\n"
+            "排错：托盘菜单「查看日志」"
+            % (APP_NAME, APP_VER, self.send_key_name, self.send_spec,
+               self.send_key_name, self.ok_send_title or "<任意窗口>",
+               self.quit_spec))
+        if self.tray:
+            self.tray.msgbox("%s v%s 用法" % (APP_NAME, APP_VER), text)
+
+    def _scan_keys(self):
+        """开一个控制台窗口跑「遥控器按键扫描器」。
+
+        用途：想知道遥控器上每个键在 Windows 里是什么 vk，
+        好把任意一个键绑成发送键（mivoice.ini 的 send_key）。
+        扫描器在 ..\\tools\\scan_remote_keys.py。
+        """
+        script = os.path.join(os.path.dirname(HERE), "tools",
+                              "scan_remote_keys.py")
+        if not os.path.exists(script):
+            if self.tray:
+                self.tray.balloon(APP_NAME, "找不到扫描器：%s" % script)
+            return
+        # 本程序是 pythonw 起的（没有控制台），要换成 python.exe 才有输出窗口
+        exe = sys.executable
+        if exe.lower().endswith("pythonw.exe"):
+            cand = os.path.join(os.path.dirname(exe), "python.exe")
+            exe = cand if os.path.exists(cand) else "python"
+        try:
+            subprocess.Popen([exe, script, "--seconds", "120"],
+                             creationflags=getattr(subprocess,
+                                                  "CREATE_NEW_CONSOLE", 0))
+            log("已启动遥控器按键扫描器：%s" % script)
+            if self.tray:
+                self.tray.balloon(APP_NAME,
+                                  "已打开扫描器窗口：把遥控器每个键按一遍")
+        except Exception as e:
+            log("启动扫描器失败: %r" % (e,))
+            if self.tray:
+                self.tray.balloon(APP_NAME, "启动扫描器失败：%r" % (e,))
 
     def _send_test(self):
         """手动发一次发送快捷键，验证 WorkBuddy 的发送设置对得上。"""
@@ -2211,7 +3038,12 @@ class App:
                 log("selftest %d 秒到，自动退出" % self.args.selftest)
                 user32.DestroyWindow(hwnd)
                 return 0
+            if wp == 3:
+                if self.arbiter:
+                    self.arbiter.tick()      # 看门狗：超时补发
+                return 0
             self._refresh_tip()
+            self._flush_key_events()
             return 0
         if msg == WM_APP_STATE:
             self._refresh_tip()
@@ -2224,6 +3056,10 @@ class App:
     # ---------------- 清理 ----------------
     def cleanup(self):
         log("清理中…")
+        self._clear_state()
+        # 复位：异常退出时 Alt 可能还按着，voice_active 必须清掉，
+        # 否则退出流程里 F5 会被无谓地吞掉（虽然进程马上就退了，但日志会误导）。
+        self.voice_active = False
         if self.ime_probe:
             try:
                 self.ime_probe.stop()
