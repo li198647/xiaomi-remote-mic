@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-遥控语音 (MiVoice) v1.8
+遥控语音 (MiVoice) v1.9
 =======================
 把「小米蓝牙语音遥控器」（RC003 同款，VID 0x2717 / PID 0x32B8）的语音键，
-变成 WorkBuddy 对话框的语音输入；顺手把两个闲置键变成鼠标滚轮。
+变成 WorkBuddy 对话框的语音输入；顺手把三个闲置键变成鼠标滚轮和退格。
 
 日常用法：
   1. 点进 WorkBuddy 的输入框（让光标在对话框里）
@@ -12,6 +12,7 @@
   4. 按遥控器 OK 键 -> 变成 Ctrl+Enter -> 发送
   5. 按遥控器 菜单键 -> 鼠标向上滚（看上面的内容）
      按遥控器 TV 键  -> 鼠标向下滚（看下面的内容）
+  6. 按遥控器 主页键 -> Backspace（删掉刚说错的一个字）
 
 原理：
   按住语音键 -> 遥控器经 BLE ATVV 协议推麦克风音频
@@ -57,6 +58,14 @@
   映射复用 v1.7 的仲裁器（吞下、放开抬、按抬起那一条 Raw Input 定性），
   所以实体键盘的「菜单键」不会误伤（会被原样补发）。
 
+🔴 v1.9：遥控器的「主页键」-> Backspace（向左删一个字）
+  主页键在 Windows 上就是 **Home**（vk=0x24）。它是遥控器上**最后一个**
+  还能用的闲置键（详见 README「遥控器按键总表」）。
+  动作走的是和滚轮同一套 v1.7 仲裁链，所以：
+    · 只吞「按下」、放行「抬起」
+    · 抬起那条 Raw Input 说是遥控器 -> 发 Backspace
+    · 说是实体键盘 -> 把 Home 原样补发（不会吃掉键盘的 Home 键）
+
 前置条件（一次性）：
   - 安装 VB-CABLE 虚拟声卡（管理员 + 重启一次）
   - Windows 声音设置里把「输入」默认设备设为 CABLE Output
@@ -88,7 +97,7 @@ import traceback
 # 0. 基本路径 / 日志
 # ===========================================================================
 APP_NAME = "遥控语音"
-APP_VER = "1.8"
+APP_VER = "1.9"
 HERE = os.path.dirname(os.path.abspath(__file__))
 INI_PATH = os.path.join(HERE, "mivoice.ini")
 LOG_PATH = os.path.join(HERE, "mivoice.log")
@@ -223,6 +232,8 @@ VK_LMENU = 0xA4       # 左 Alt —— Electron/Chromium 认这个才当「真�
 VK_LCONTROL = 0xA2    # 左 Ctrl
 VK_LSHIFT = 0xA0      # 左 Shift
 VK_F5 = 0x74
+VK_BACK = 0x08        # 🔴 v1.9：Backspace（遥控器主页键要发的目标键）
+VK_HOME = 0x24        # 遥控器主页键在 Windows 里的真实身份
 
 # 修饰键必须带硬件扫描码，Chromium 靠它判断左右键并维持按住状态。
 # 只发 VK + wScan=0 时，Electron 会把它当成一次性的虚拟点按（表现为「只亮一下」）。
@@ -230,6 +241,9 @@ SCAN_BY_VK = {
     VK_MENU: 0x38, VK_LMENU: 0x38,
     VK_CONTROL: 0x1D, VK_LCONTROL: 0x1D,
     VK_SHIFT: 0x2A, VK_LSHIFT: 0x2A,
+    # 🔴 v1.9：Backspace 的硬件扫描码。修饰键之外目前只有它需要显式扫描码
+    #（遥控器主页键 -> Backspace 走这条路）。缺了也能按下，但带上更接近真键盘。
+    0x08: 0x0E,
 }
 
 # 托盘图标字形（Segoe MDL2 Assets：E720 = Microphone）
@@ -707,6 +721,11 @@ DEFAULTS = {
         "scroll_down_key": "0xc0",    # TV 键（vk=0xC0）   -> 向下滚（看下面的内容）
         "scroll_step": "120",         # 一次滚动量。120 = Windows 定义的一格（约 3 行）
         "scroll_repeat_ms": "120",    # 按住不放时的连续滚动间隔（毫秒）
+        # ---- 🔴 v1.9：遥控器按键 -> Backspace（向左删一个字）----
+        # 主页键在 Windows 上就是 Home(0x24)，是遥控器上最后一个还能用的闲置键。
+        # 填 "" 可关闭（那就是原生的 Home = 回到行首）。
+        "backspace_enable": "1",      # 1 = 启用「按键 -> Backspace」
+        "backspace_key": "home",      # 主页键（vk=0x24）-> Backspace
         # ---- 结束 ----
         "hotkey_quit": "Ctrl+Shift+M",  # 退出热键（实测 Ctrl+Alt+M/V/O/Q/X/Z/L 已被占用）
         "autostart": "0",             # 开机自启（托盘菜单可切，会写回本文件）
@@ -1297,7 +1316,10 @@ VK_ALIASES = {
 }
 VK_LABELS = {
     0x0D: "Enter 回车", 0x20: "空格", 0x09: "Tab", 0x1B: "Esc",
+    0x08: "Backspace 退格",
     0x25: "左方向键", 0x26: "上方向键", 0x27: "右方向键", 0x28: "下方向键",
+    # 🔴 v1.9：0x24 是标准 Home 键，但在这台遥控器上物理写法是「主页键」
+    0x24: "主页键(Home)",
     0x5D: "菜单键", 0x6E: "小键盘 Enter",
     # 🔴 v1.8：小米遥控器的 TV 键。0xC0 在 Windows 里没有官方 VK 名
     #（KMODE_MEDIA 之类都不是），是遥控器固件自己报的一个自定义键值。
@@ -1421,6 +1443,34 @@ class KeySender:
         self.down(name)
         time.sleep(max(0.01, hold_ms / 1000.0))
         self.up(name)
+
+    def tap_vk(self, vk: int, hold_ms: int = 0):
+        """按一下并松开**一个 VK 码**（不查 VK_MAP 的键名表）。
+
+        🔴 为什么不用 `tap("backspace")`：`tap` 走的是 `VK_MAP`，
+        那张表里只有 alt/ctrl/shift/f5/enter/win/space/tab/esc 九个名字，
+        查不到就**默认发 Alt**(VK_LMENU) —— 想发退格结果弹了菜单栏，
+        而且不报任何错。所以按键动作统一走这个显式的 VK 版本。
+
+        `hold_ms=0` = 按下和抬起合并成一次 SendInput（真键盘上退格按下的
+        瞬间就删字了，不需要按住时长）。需要间隔时再传正数。
+        """
+        if hold_ms <= 0:
+            arr = (INPUT * 2)()
+            for i, is_up in enumerate((False, True)):
+                arr[i].type = INPUT_KEYBOARD
+                arr[i].ki = KEYBDINPUT(vk, SCAN_BY_VK.get(vk, 0),
+                                       KEYEVENTF_KEYUP if is_up else 0, 0, None)
+            n = user32.SendInput(2, arr, ctypes.sizeof(INPUT))
+            if n != 2:
+                raise OSError("SendInput 发键 0x%02X 失败 err=%s"
+                              % (vk, ctypes.get_last_error()))
+        else:
+            self._send_key(vk, 0)
+            time.sleep(hold_ms / 1000.0)
+            self._send_key(vk, KEYEVENTF_KEYUP)
+        dbg("tap vk=0x%02X scan=0x%02X" % (vk, SCAN_BY_VK.get(vk, 0)))
+        return True
 
     def send_combo(self, spec: str) -> bool:
         """一次性发送组合键，例如 "ctrl+enter"。所有事件合并成一次 SendInput。"""
@@ -1899,6 +1949,8 @@ class SendArbiter:
         self._repeat_emit_ts = 0.0  # 上次发出重复滚动的时间
         self.stats = {"sent": 0, "replayed": 0, "timeout": 0, "dropped": 0,
                       "repeat": 0, "up_raw": 0, "scrolled": 0,
+                      # 🔴 v1.9：主页键 -> Backspace 的触发次数
+                      "backspaced": 0,
                       # 🔴 v1.8：抬起事件的 vk 和按下时对不上（VKey=0xFF 之类）
                       "up_vk_mismatch": 0}
 
@@ -1910,6 +1962,7 @@ class SendArbiter:
           "send"        OK 键 / 回车 -> 发送快捷键
           "scroll_up"   菜单键       -> 鼠标滚轮向上
           "scroll_down" TV 键        -> 鼠标滚轮向下
+          "backspace"   主页键       -> Backspace（删一个字）
 
         🔴 v1.6 关键修复：**按住不放不能连发！**
 
@@ -2132,14 +2185,18 @@ class SendArbiter:
             return "鼠标向上滚"
         if action == "scroll_down":
             return "鼠标向下滚"
+        if action == "backspace":
+            return "发 Backspace（删一个字）"
         return action
 
     def _do_action(self, action: str, via: str):
-        """按动作类型分派。v1.8 从「只会发送」变成「发送 / 上滚 / 下滚」。"""
+        """按动作类型分派。v1.9 从「发送 / 上滚 / 下滚」扩到「+ 退格」。"""
         if action == "send":
             self._do_send(via)
         elif action in ("scroll_up", "scroll_down"):
             self._do_scroll(action, via)
+        elif action == "backspace":
+            self._do_backspace(via)
         else:
             # 未知动作：宁可记一笔，也别静默吞掉用户的按键
             dbg("未知动作 %r（来源 %s），按发送处理" % (action, via))
@@ -2178,6 +2235,29 @@ class SendArbiter:
         except Exception as e:
             self.stats["dropped"] += 1
             log("！！滚轮注入失败: %r" % (e,))
+
+    def _do_backspace(self, via: str):
+        """遥控器主页键 -> Backspace（向左删掉一个字）。
+
+        🔴 v1.9 新增。为什么单开一个方法而不是复用 `_do_send`：
+          发送是「组合键」，删除是「单键」，两者 config 来源不同；
+          而且日志要能分开统计（删字次数远比发送次数多，混在一起看不出问题）。
+
+        ⚠️ 绝不连发：一次「按下-松开」只删一个字。
+           按住不放时的自动重复在 `on_hook_down` 里被吞掉、不新增 pending，
+           所以按多久都只删一个字。理由：删除是**破坏性**动作，
+           万一判据出错（误把实体键盘的 Home 当成遥控器），
+           连发就是一口气删掉一大段 —— 代价太大，不值得。
+        """
+        try:
+            self.app.keys.tap_vk(VK_BACK)
+            self.app.backspace_count += 1
+            self.stats["backspaced"] += 1
+            log("主页键已转换：%s -> Backspace（删一个字）（来源 %s）"
+                % (self.app.backspace_key_name, via))
+        except Exception as e:
+            self.stats["dropped"] += 1
+            log("！！Backspace 注入失败: %r" % (e,))
 
     def _do_replay(self, pend: dict, via: str):
         try:
@@ -2409,7 +2489,7 @@ class EnterSendHook:
 
         tag 用来区分「为什么被吞」：
           "SWAL" = 遥控器语音键 F5 被吞（防 WorkBuddy 误判组合键）
-          "SND"  = 发送键被仲裁器吞（等抬起那条 Raw Input 确认设备归属）
+          "SND"  = 发送键 / 退格键被仲裁器吞（等抬起那条 Raw Input 确认设备归属）
           "SCR"  = 滚轮键被仲裁器吞（同上，只是动作换成鼠标滚轮）
           "UPE"  = 映射键的抬起被**故意放行**（这样 Raw Input 才会到）
         """
@@ -2721,6 +2801,26 @@ class App:
                 "向下滚会失效" % self.scroll_up_vk)
         self.scroll_on = bool(
             self.scroll_enable and (self.scroll_up_vk or self.scroll_down_vk))
+        # ---- 🔴 v1.9：遥控器按键 -> Backspace（向左删一个字）----
+        self.backspace_enable = self.cfg.b("general", "backspace_enable")
+        self.backspace_spec = self.cfg.s("general", "backspace_key") or ""
+        self.backspace_vk = (parse_vk_spec(self.backspace_spec)
+                             if self.backspace_spec else None)
+        if self.backspace_spec and self.backspace_vk is None:
+            log("！！backspace_key=%r 解析不出来，退格键不启用"
+                % self.backspace_spec)
+        if self.backspace_vk and self.backspace_vk in (self.scroll_up_vk,
+                                                       self.scroll_down_vk):
+            log("！！backspace_key 和滚轮键配成了同一个键（0x%02X），"
+                "该键只会滚动、不会删字 —— 请改 mivoice.ini"
+                % self.backspace_vk)
+        if self.backspace_vk and self.backspace_vk == self.send_key_vk:
+            log("！！backspace_key 和发送键配成了同一个键（0x%02X），"
+                "该键只会发送、不会删字 —— 请改 mivoice.ini"
+                % self.backspace_vk)
+        self.backspace_on = bool(self.backspace_enable and self.backspace_vk)
+        self.backspace_key_name = (vk_label(self.backspace_vk)
+                                   if self.backspace_vk else "退格键")
         self.host = None
         self.tray = None
         self.remote = None
@@ -2734,6 +2834,7 @@ class App:
         self.ime_probe = None
         self.ok_send_count = 0
         self.scroll_count = 0        # 🔴 v1.8：滚轮键触发次数
+        self.backspace_count = 0     # 🔴 v1.9：主页键 -> Backspace 的触发次数
         self._last_scroll_log = 0.0  # 滚轮日志节流（按住连滚会刷屏）
         self._last_f5_raw_log = 0.0     # 语音键原始事件的日志节流
         self._last_other_raw_log = 0.0  # 其它设备按发送键的日志节流
@@ -2795,7 +2896,8 @@ class App:
                 self.ok_to_send = False
         # 🔴 v1.8：滚轮映射也需要 arbiter + Raw Input（判设备归属），
         #    所以条件从「ok_to_send」放宽成「任一映射启用」。
-        if self.ok_to_send or self.scroll_on:
+        # 🔴 v1.9：退格映射同理，一起算进来。
+        if self.ok_to_send or self.scroll_on or self.backspace_on:
             self.arbiter = SendArbiter(self)
             self.remote_input = RemoteInputWatcher(
                 self.host, self.cfg.s("general", "device_match"),
@@ -2820,6 +2922,9 @@ class App:
                 log("滚轮键已启用：%s（任意窗口生效；一步 %d，按住每 %dms 滚一次）"
                     % ("；".join(parts), self.scroll_step,
                        self.scroll_repeat_ms))
+            if self.backspace_on:
+                log("退格键已启用：%s -> Backspace（任意窗口生效；一次一下，不连发）"
+                    % self.backspace_key_name)
             log("  判定方式 v1.7：吞掉「按下」、放行「抬起」，"
                 "用抬起那条 Raw Input 的设备归属定性"
                 "（抬起确认超过 %dms 未到则按最近 %dms 活动兜底）"
@@ -3063,12 +3168,12 @@ class App:
         if self.remote_input:
             self.remote_input.last_activity = time.time()
 
-    # ---------------- 🔴 v1.8：按键映射（发送 / 上滚 / 下滚） ----------------
+    # ---------------- 🔴 v1.8/v1.9：按键映射（发送 / 上滚 / 下滚 / 退格） ----------------
     def hook_action_for(self, vk: int):
         """这个 vk 对应哪个动作？没有映射就返回 None。
 
         ⚠️ 钩子回调里会调它，所以**必须极快**：只做整数比较，不查表不求值。
-        顺序有意义：发送优先（怕 ini 配重了之后滚轮抢走 OK 键）。
+        顺序有意义：发送优先（怕 ini 配重了之后别的动作抢走 OK 键）。
         """
         if self.ok_to_send and vk == self.send_key_vk:
             return "send"
@@ -3077,31 +3182,48 @@ class App:
                 return "scroll_up"
             if self.scroll_down_vk and vk == self.scroll_down_vk:
                 return "scroll_down"
+        if self.backspace_on and vk == self.backspace_vk:
+            return "backspace"
         return None
 
-    def action_precheck(self, action: str) -> bool:
-        """钩子里的前置条件：这个动作要不要进入仲裁。
+    def map_precheck(self, on: bool) -> bool:
+        """「不限于 WorkBuddy」的那一类映射键（滚轮 / 退格）的公共前置条件。
 
-        🔴 发送和滚轮的**判据不一样**：
-          · 发送：只在前台是 WorkBuddy 时生效（别在别的程序里把回车改成 Ctrl+Enter）
-          · 滚轮：**任何窗口都生效** —— 木木要用它翻网页、翻文档、翻聊天记录，
-                  限制成 WorkBuddy 就等于没用
+        判据比发送宽松得多：
+          · 只要求总开关打开 + 程序没被暂停
+          · 但不能有修饰键按着 —— 木木自己按 Ctrl+主页键、Ctrl+菜单键时
+            不掺和，免得把系统快捷键吃掉
+
+        🔴 为什么不限制前台窗口：滚轮要用来翻网页/翻文档/翻聊天记录，
+        退格要在任何输入框里都能删字，限制成 WorkBuddy 就等于没用。
         """
-        if action == "send":
-            return self.ok_precheck()
-        return self.scroll_precheck()
-
-    def scroll_precheck(self) -> bool:
-        """滚轮键的前置条件（比发送宽松得多）。
-
-        仍然检查「有没有按着修饰键」：木木自己按 Ctrl+菜单键时不掺和，
-        免得把系统快捷键吃掉。
-        """
-        if not self.scroll_on or not self.enabled:
+        if not on or not self.enabled:
             return False
         if self.enter_hook is not None and self.enter_hook.mods_down():
             return False
         return True
+
+    def action_precheck(self, action: str) -> bool:
+        """钩子里的前置条件：这个动作要不要进入仲裁。
+
+        🔴 发送和映射键（滚轮/退格）的**判据不一样**：
+          · 发送：只在前台是 WorkBuddy 时生效
+                  （别在别的程序里把回车改成 Ctrl+Enter）
+          · 滚轮 / 退格：**任何窗口都生效**
+        """
+        if action == "send":
+            return self.ok_precheck()
+        if action == "backspace":
+            return self.edit_precheck()
+        return self.scroll_precheck()
+
+    def scroll_precheck(self) -> bool:
+        """滚轮键的前置条件。"""
+        return self.map_precheck(self.scroll_on)
+
+    def edit_precheck(self) -> bool:
+        """🔴 v1.9：退格键的前置条件（和滚轮同档，任何窗口生效）。"""
+        return self.map_precheck(self.backspace_on)
 
     def scroll_key_name(self, action: str) -> str:
         vk = self.scroll_up_vk if action == "scroll_up" else self.scroll_down_vk
@@ -3298,6 +3420,8 @@ class App:
                 bits.append("发送 %d 次" % self.ok_send_count)
             if self.scroll_on:
                 bits.append("滚动 %d 次" % self.scroll_count)
+            if self.backspace_on:
+                bits.append("删字 %d 次" % self.backspace_count)
             extra = ("，" + "，".join(bits)) if bits else ""
             tip = "%s | 待命（语音 %d 次%s）" % (APP_NAME, self.sessions_ok, extra)
             icon = self._hicon_idle
@@ -3403,14 +3527,28 @@ class App:
             "2. 点进 WorkBuddy 输入框，按住遥控器语音键说话\r\n"
             "3. 松手出字；按遥控器的「%s」键发送（= %s）\r\n"
             "\r\n"
+            "遥控器按键：\r\n"
+            "· 语音键 = 按住说话\r\n"
+            "· %s = %s（仅 WorkBuddy 窗口）\r\n"
+            "%s"
+            "%s"
+            "\r\n"
             "注意：\r\n"
             "· 说话和发送时，焦点都要在 WorkBuddy 输入框\r\n"
             "· 「%s」键只有在焦点窗口标题含「%s」时才会变成发送\r\n"
-            "· 实体键盘的 Enter 不受影响（只是会晚几毫秒送达）\r\n"
+            "· 滚轮键和退格键在**任何窗口**都生效，但按住 Ctrl/Shift/Alt 时不掺和\r\n"
+            "· 实体键盘的同名按键不受影响（只是会晚几毫秒送达）\r\n"
             "· 退出热键：%s\r\n"
             "\r\n"
             "排错：托盘菜单「查看日志」"
             % (APP_NAME, APP_VER, self.send_key_name, self.send_spec,
+               self.send_key_name, self.send_spec,
+               ("· %s = 鼠标向上滚（看上面的内容）\r\n" % vk_label(self.scroll_up_vk)
+                if self.scroll_on and self.scroll_up_vk else ""),
+               (("· %s = 鼠标向下滚（看下面的内容）\r\n" % vk_label(self.scroll_down_vk)
+                 if self.scroll_on and self.scroll_down_vk else "")
+                + ("· %s = Backspace（向左删一个字）\r\n" % self.backspace_key_name
+                   if self.backspace_on else "")),
                self.send_key_name, self.ok_send_title or "<任意窗口>",
                self.quit_spec))
         if self.tray:
@@ -3421,10 +3559,18 @@ class App:
 
         用途：想知道遥控器上每个键在 Windows 里是什么 vk，
         好把任意一个键绑成发送键（mivoice.ini 的 send_key）。
-        扫描器在 ..\\tools\\scan_remote_keys.py。
+        🔴 v1.9 修：扫描器位置要**自适应**——仓库里是 `mivoice\\tools\\`，
+        早期的工作目录是外面同级的 `..\\tools\\`，两种布局都得能找到。
         """
-        script = os.path.join(os.path.dirname(HERE), "tools",
-                              "scan_remote_keys.py")
+        script = None
+        for cand in (os.path.join(HERE, "tools", "scan_remote_keys.py"),
+                     os.path.join(os.path.dirname(HERE), "tools",
+                                  "scan_remote_keys.py")):
+            if os.path.exists(cand):
+                script = cand
+                break
+        if script is None:
+            script = os.path.join(HERE, "tools", "scan_remote_keys.py")
         if not os.path.exists(script):
             if self.tray:
                 self.tray.balloon(APP_NAME, "找不到扫描器：%s" % script)

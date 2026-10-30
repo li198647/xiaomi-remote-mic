@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""一键验证「遥控器 OK 键 -> 发送」+「菜单键/TV 键 -> 滚轮」这条链路到底通没通。
+"""一键验证「遥控器 OK 键 -> 发送」+「菜单/主页/TV 键 -> 滚轮|退格」这条链路通没通。
 
 用法：双击 tools\\verify-remote-send.bat
 
@@ -21,6 +21,11 @@
    音量键 / 返回键在 Windows 上压根不上报，所以改用两个闲置键：
      菜单键（Apps, 0x5D）-> 鼠标向上滚   TV 键（0xC0）-> 鼠标向下滚
    日志标记是「滚轮键已转换：... （来源 up）」。
+
+🔴 v1.9 新增：主页键
+   主页键（Home, 0x24）-> Backspace（向左删一个字）。
+   日志标记是「主页键已转换：... （来源 up）」。
+   ⚠️ 测之前最好先打几个字在输入框里，不然删不出效果（日志照记，但人看不见）。
 
 🔴 还要盯一条新日志：「Raw Input：忽略 hdev=0 的注入回声」
    —— 这是**正常**的（那是我们自己 SendInput 注入的按键）。
@@ -201,7 +206,10 @@ def main():
     print("  4) 再按遥控器的【菜单键】【TV 键】各一下（验证滚轮映射，v1.8 新增）")
     print("     菜单键 = 鼠标向上滚（看上面的内容）")
     print("     TV 键  = 鼠标向下滚（看下面的内容）")
-    print("  5) 盯着下面的窗口，什么都不用管")
+    print("  5) 最后按一下遥控器的【主页键】（验证退格映射，v1.9 新增）")
+    print("     主页键 = Backspace（向左删一个字）")
+    print("     ⚠️ 先在输入框里打几个字，不然删不出可见效果")
+    print("  6) 盯着下面的窗口，什么都不用管")
     print()
     print("（最多等 120 秒；按 Ctrl+C 可以随时退出）")
     print("-" * 66)
@@ -210,7 +218,7 @@ def main():
             "converted_timeout": 0, "converted_raw": 0,
             "replayed": 0, "other_raw": 0,
             "no_devname": 0, "devname_ok": 0, "watchdog": 0, "echo": 0,
-            "scroll_up": 0, "scroll_down": 0}
+            "scroll_up": 0, "scroll_down": 0, "backspace": 0}
     grace_until = 0.0
     t0 = time.time()
     while time.time() - t0 < 120:
@@ -245,14 +253,17 @@ def main():
                     seen["scroll_up"] += 1
                 elif "向下滚" in ln:
                     seen["scroll_down"] += 1
+            elif "主页键已转换" in ln:
+                seen["backspace"] += 1
         got_main = (seen["ok_raw"] or seen["converted_up"]
                     or seen["converted_timeout"] or seen["converted_raw"]
-                    or seen["scroll_up"] or seen["scroll_down"])
+                    or seen["scroll_up"] or seen["scroll_down"]
+                    or seen["backspace"])
         if got_main and not grace_until:
-            # 收到主结果后不要立刻收工 —— 再留 10 秒给滚轮键
+            # 收到主结果后不要立刻收工 —— 再留 10 秒给滚轮键 / 主页键
             grace_until = time.time() + 10.0
-            print("  ... 已收到结果，再等 10 秒顺手收【滚轮键】"
-                  "（可以按遥控器的菜单键 / TV 键）...")
+            print("  ... 已收到结果，再等 10 秒顺手收【滚轮键 / 主页键】"
+                  "（可以按遥控器的菜单键 / TV 键 / 主页键）...")
         elif grace_until and time.time() > grace_until:
             break
         time.sleep(0.25)
@@ -314,10 +325,18 @@ def main():
         print("  ? 没看到「滚轮键已转换」")
         print("    -> 要么没按菜单键 / TV 键，要么这两个键没被识别成遥控器。")
         print("       注意：滚轮键**不需要**前台是 WorkBuddy，任何窗口都该生效。")
+    # ---- 🔴 v1.9：主页键 -> Backspace ----
+    if seen["backspace"]:
+        print("  √ 主页键生效：删字 %d 次（Backspace）" % seen["backspace"])
+        print("    -> 输入框里的字应该真的少了一个")
+    else:
+        print("  ? 没看到「主页键已转换」")
+        print("    -> 要么没按主页键，要么这一下没被识别成遥控器。")
+        print("       也可能 ini 里 backspace_enable=0 / backspace_key 写错了。")
     print()
     print("按键日志（看 SND / SCR / UPE / SWAL 标记）：%s"
           % os.path.join(MIVOICE_DIR, "mivoice_keys.log"))
-    print("  SND = 发送键「按下」被吞；SCR = 滚轮键「按下」被吞；")
+    print("  SND = 发送键 / 退格键「按下」被吞；SCR = 滚轮键「按下」被吞；")
     print("  UPE = 映射键「抬起」放行（v1.7 的关键：抬起那条 Raw Input 才有设备归属）")
     print("完整日志：%s" % LOG)
     input("\n按回车退出…")

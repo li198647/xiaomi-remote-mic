@@ -153,6 +153,7 @@ class _FakeKeys:
         self.calls = []
         self.replays = []
         self.wheels = []          # 🔴 v1.8：记录滚轮 delta（正=上滚，负=下滚）
+        self.taps = []            # 🔴 v1.9：记录 tap_vk 发出的 VK 码
 
     def send_combo(self, spec):
         self.calls.append(spec)
@@ -164,6 +165,10 @@ class _FakeKeys:
 
     def scroll(self, delta, horizontal=False):
         self.wheels.append(delta)
+        return True
+
+    def tap_vk(self, vk, hold_ms=0):
+        self.taps.append(vk)
         return True
 
 
@@ -1094,6 +1099,113 @@ def t_scroll_exec():
         "抬起 vk 对不上时也要配对成功，实际 %r" % (app.keys.wheels,)
 
 
+def t_backspace_mapping():
+    """v1.9：遥控器主页键(Home) -> Backspace 的映射与优先级。
+
+    主页键是遥控器上**最后一个**还能用的闲置键（音量±/返回键在固件层
+    就不上报，见 tools\\probe_hidden_keys.py）。这条用例锁死三件事：
+      1. home 确实映射成 backspace，别的键不受影响
+      2. 开关关掉后主页键恢复原生 Home（回到行首）
+      3. 配重了时发送优先（发送是主线功能）
+    """
+    app, _hook = _make_sender_app()
+    app.backspace_on = True
+    app.backspace_vk = M.VK_HOME
+
+    assert app.hook_action_for(M.VK_HOME) == "backspace", "主页键应映射成退格"
+    assert app.hook_action_for(M.VK_RETURN) == "send", "OK 键仍是发送"
+    assert app.hook_action_for(0x41) is None, "没配的键不该有动作"
+
+    # 关掉退格 -> 主页键不再有动作（恢复系统原生 Home = 回到行首）
+    app.backspace_on = False
+    assert app.hook_action_for(M.VK_HOME) is None
+    app.backspace_on = True
+
+    # 配重了：同一个键既是发送键又配成退格键 -> 发送优先
+    app.backspace_vk = M.VK_RETURN
+    assert app.hook_action_for(M.VK_RETURN) == "send", \
+        "同一个键配成发送+退格时，必须发送优先"
+    app.backspace_vk = M.VK_HOME
+
+    # 🔴 常量与「默认 Alt 陷阱」：
+    #    退格键必须走 tap_vk(VK_BACK) 而不是 tap("backspace") ——
+    #    因为 tap() 查的是 VK_MAP，查不到就默认发 Alt(VK_LMENU)，
+    #    表现为「想删字却弹出菜单栏」，而且一个字都不报错。
+    assert M.VK_BACK == 0x08, M.VK_BACK
+    assert M.VK_HOME == 0x24, M.VK_HOME
+    assert M.SCAN_BY_VK.get(M.VK_BACK) == 0x0E, "Backspace 扫描码应是 0x0E"
+    assert "backspace" not in M.VK_MAP, \
+        "VK_MAP 里出现了 backspace -> tap() 的默认 Alt 陷阱已消失，本用例可简化"
+
+
+def t_backspace_exec():
+    """v1.9：主页键 -> Backspace 的完整链路（复用 v1.7 仲裁器）。
+
+    链路：吞掉按下 -> 放行抬起 -> 抬起那条 Raw Input 定性 ->
+          遥控器 = 发 Backspace / 实体键盘 = 把 Home 原样补发。
+    """
+    M.user32.GetForegroundWindow = lambda: 1
+    M.title_matches = lambda hwnd, part: True
+
+    app, hook = _make_sender_app()
+    app.backspace_on = True
+    app.backspace_vk = M.VK_HOME
+    app.backspace_key_name = M.vk_label(M.VK_HOME)
+    app.backspace_count = 0
+    # 🔴 故意让「发送」的前置条件不满足：退格键**不该**受这个限制 ——
+    #    木木要在任何输入框里都能删字
+    app.ok_send_title = "__不存在的窗口__"
+
+    # Home 在真键盘上是扩展键（E0 47）-> flags 带 LLKHF_EXTENDED(0x01)
+    kb = M.KBDLLHOOKSTRUCT(M.VK_HOME, 0x47, 0x01, 0, 0)
+    lp = ctypes.addressof(kb)
+
+    # 1) 正例：按下被吞，但还没删字（等抬起的 Raw Input 定性）
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "主页键按下没被吞"
+    assert app.keys.taps == [], "还没定性就删字了"
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
+    app._on_raw_keyup(M.VK_HOME, 0x47, True)
+    assert app.keys.taps == [M.VK_BACK], \
+        "主页键应发 Backspace(0x08)，实际 %r" % (app.keys.taps,)
+    assert app.keys.calls == [], "退格键不该触发发送快捷键"
+    assert app.keys.wheels == [], "退格键不该滚轮"
+    assert app.backspace_count == 1, app.backspace_count
+
+    # 2) 判成实体键盘 -> 不删字，把 Home 原样补发（含扩展键标志）
+    app.keys.taps = []
+    app.keys.replays = []
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1
+    hook._on_key(0, M.WM_KEYUP, lp)
+    app._on_raw_keyup(M.VK_HOME, 0x47, False)
+    assert app.keys.taps == [], "判成实体键盘时不该删字"
+    assert app.keys.replays == [(M.VK_HOME, 0x47, True)], app.keys.replays
+
+    # 3) 🔴 按住不放 -> 只删一个字（删除是破坏性动作，绝不连发）
+    app.keys.taps = []
+    kb3 = M.KBDLLHOOKSTRUCT(M.VK_HOME, 0x47, 0x01, 0, 0)
+    lp3 = ctypes.addressof(kb3)
+    for _ in range(8):                      # 模拟系统自动重复
+        assert hook._on_key(0, M.WM_KEYDOWN, lp3) == 1
+    hook._on_key(0, M.WM_KEYUP, lp3)
+    app._on_raw_keyup(M.VK_HOME, 0x47, True)
+    app.arbiter._repeat_emit_ts = 0.0
+    app.arbiter.tick()                      # 定时器也不该补发
+    assert app.keys.taps == [M.VK_BACK], \
+        "按住不放只能删一个字，实际 %r" % (app.keys.taps,)
+
+    # 4) 程序暂停时不吞（否则「暂停」了主页键还是删不了字）
+    app.enabled = False
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) != 1, "程序暂停时不该吞主页键"
+    app.enabled = True
+
+    # 5) 用户自己按着 Ctrl 时不掺和（免得吃掉 Ctrl+Home 这类系统快捷键）
+    app.enter_hook._mods.add(M.VK_CONTROL)
+    app.keys.taps = []
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) != 1, \
+        "有修饰键按着时不该吞主页键"
+    app.enter_hook._mods.discard(M.VK_CONTROL)
+
+
 def t_scroll_input_layout():
     """v1.8：滚轮事件的 INPUT 内存布局（这里踩过坑，必须锁死）。
 
@@ -1151,6 +1263,8 @@ def main():
     check("滚轮键：按键 -> 动作映射", t_scroll_mapping)
     check("滚轮键：菜单上滚 / TV 下滚", t_scroll_exec)
     check("滚轮键：INPUT 内存布局", t_scroll_input_layout)
+    check("退格键：主页键 -> 动作映射", t_backspace_mapping)
+    check("退格键：主页键 -> Backspace", t_backspace_exec)
     check("F5 拦截（遥控器语音键）", t_f5_swallow)
     print("=" * 60)
     print("通过 %d / %d" % (len(PASS), len(PASS) + len(FAIL)))
