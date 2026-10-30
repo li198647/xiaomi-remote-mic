@@ -163,8 +163,14 @@ class _FakeKeys:
 
 class _FakeRawInput:
     def __init__(self, age_ms=0.0):
+        # 最近一次**遥控器**按键的时刻
         self.last_activity = time.time() - age_ms / 1000.0
-        # 🔴 v1.6：最近一次「实体键盘按发送键」的时刻（看门狗兜底判据用）
+        # 🔴 v1.7：最近一次**实体键盘**按键的时刻
+        #    （v1.6 只有 last_send_other_ts，靠「实体键盘按发送键」记时间，
+        #      但那个回车会被我们吞掉、自己那条 Raw Input 永远不到，
+        #      而且注入回声还会污染它 -> 判据彻底失灵）
+        self.last_physical_ts = 0.0
+        # 🔴 v1.6 保留字段：最近一次「实体键盘按发送键」的时刻
         self.last_send_other_ts = 0.0
 
 
@@ -215,17 +221,19 @@ def t_combo_seq():
 
 
 def t_ok_hook():
-    """验证新的「发送键仲裁」链路。
+    """验证 v1.7 的新链路：**吞下、放开抬、用抬起那条 Raw Input 定性**。
 
-    🔴 v1.4 的关键变化（也是 v1.3 一直不生效的根因修复）：
-      - 旧版：钩子里靠「遥控器最近 3 秒内活动过」判断 -> 按下 OK 键的
-        那一刻这一下自己的 Raw Input 还没处理，**第一次按必然失效**；
-      - 新版：钩子**先吞掉**，等 Raw Input（异步）按设备确认：
-        是遥控器 -> 发发送快捷键；不是 -> **补发**原键（用户无感）。
+    🔴 v1.7 架构革新（2026-10-30 实测钉死）：
+      v1.3~v1.6 是「吞下 -> 等**这一下**的 Raw Input」——
+      但被钩子吞掉的按键**根本不会有 Raw Input**（探针：全吞 0 条），
+      所以那条链在 Windows 上**结构性地走不通**。
+
+      v1.7 改成：吞掉「按下」-> 放行「抬起」-> 抬起那条 Raw Input 会到
+      -> 它的 hDevice 就是这一下的**确定**设备归属。
 
     ⚠️ 必须把「前台窗口 / 标题匹配」两处外部依赖打桩：
-    真实环境里前台窗口会变（可能压根没有前台窗口），会导致这条用例
-    偶发失败（踩过一次）。打桩后结果完全确定。
+       真实环境里前台窗口会变（可能压根没有前台窗口），会导致这条用例
+       偶发失败（踩过一次）。打桩后结果完全确定。
     """
     M.user32.GetForegroundWindow = lambda: 1
     M.title_matches = lambda hwnd, part: (not part) or ("workbuddy" in part.lower())
@@ -234,38 +242,39 @@ def t_ok_hook():
     kb = M.KBDLLHOOKSTRUCT(M.VK_RETURN, 0x1C, 0, 0, 0)
     lp = ctypes.addressof(kb)   # 系统传进来的是整数地址，测试也照此
 
-    # 1) 正例：钩子先吞掉，但**还没发送**（要等 Raw Input 确认）
-    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "发送键没被吞掉"
-    assert app.keys.calls == [], "还没确认设备就发送了：%s" % (app.keys.calls,)
-    assert app.keys.replays == [], "还没确认设备就补发了"
+    # 1) 正例：按下被吞掉，但**还没发送**（要等抬起的 Raw Input 定性）
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "发送键的按下没被吞掉"
+    assert app.keys.calls == [], "还没定性就发送了：%s" % (app.keys.calls,)
+    assert app.keys.replays == [], "还没定性就补发了"
 
-    # 2) Raw Input 到了，设备 = 遥控器 -> 变成发送快捷键
-    app.arbiter.on_raw_keydown(M.VK_RETURN, 0x1C, True)
+    # 2) 🔴🔴 抬起必须**放行**（v1.7 的关键）：
+    #    不放行 -> 抬起那条 Raw Input 不来 -> 拿不到设备归属
+    #    -> OK 键永远发不出去（v1.3~v1.6 就是栽在这）
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, \
+        "🔴 抬起被吞了 -> 拿不到设备归属 -> OK 键永远发不出去"
+
+    # 3) 抬起那条 Raw Input 到了，设备 = 遥控器 -> 变成发送快捷键
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, True)
     assert app.keys.calls == ["ctrl+enter"], app.keys.calls
-    assert app.keys.replays == [], "遥控器按的不该补发"
+    assert app.keys.replays == [], app.keys.replays
 
-    # 3) 配对的抬起也要吞，防残留状态
-    assert hook._on_key(0, M.WM_KEYUP, lp) == 1, "抬起没吞"
-    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "没吞过的抬起不该拦"
-
-    # 4) 反例：Raw Input 说是实体键盘 -> 必须把原键补发回去，
+    # 4) 反例：抬起那条 Raw Input 说不是遥控器 -> 必须把原键补发回去，
     #    否则用户「敲了回车没反应」
     app.keys.calls = []
     app.keys.replays = []
-    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "实体键盘的回车也该先吞"
-    app.arbiter.on_raw_keydown(M.VK_RETURN, 0x1C, False)
-    assert app.keys.calls == [], "实体键盘不该被转成发送"
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "发送键的按下没被吞"
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起不该被吞"
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, False)
+    assert app.keys.calls == [], app.keys.calls
     assert app.keys.replays == [(M.VK_RETURN, 0x1C, False)], app.keys.replays
-    assert hook._on_key(0, M.WM_KEYUP, lp) == 1, "补发过的抬起也要吞"
 
-    # 5) 长按自动重复：🔴 v1.6 起，**按住不放只发一次**
-    #    （旧版每次重复都发一次 = 「一次按住连发 6 次」，是 bug 不是特性。
-    #      v1.5 日志 17:32:49 / 17:36:03 连续 6 条「发送键已转换（来源 raw）」就是现场。）
+    # 5) 长按自动重复：🔴 按住不放只发一次
     app.keys.calls = []
     app.keys.replays = []
     for _ in range(5):
         assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1
-        app.arbiter.on_raw_keydown(M.VK_RETURN, 0x1C, True)
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, True)
     assert app.keys.calls == ["ctrl+enter"], \
         "🔴 按住不放应该只发一次，实际发了 %r" % (app.keys.calls,)
     assert app.keys.replays == [], app.keys.replays
@@ -297,7 +306,7 @@ def t_ok_hook():
     hook._on_key(0, M.WM_KEYUP, ctypes.addressof(kctrl))
     assert hook.mods_down() is False, "修饰键抬起后没复位"
 
-    # 8) 非发送键、本程序注入的事件，都必须放行
+    # 8) 各种「必须放行」的情况（非发送键、本程序注入的事件）
     ka = M.KBDLLHOOKSTRUCT(ord("A"), 0x1E, 0, 0, 0)
     assert hook._on_key(0, M.WM_KEYDOWN, ctypes.addressof(ka)) != 1, "A 键被拦了"
     kinj = M.KBDLLHOOKSTRUCT(M.VK_RETURN, 0x1C, M.LLKHF_INJECTED, 0, 0)
@@ -310,7 +319,11 @@ def t_ok_hook():
 
 
 def t_arbiter_timeout():
-    """看门狗：吞了但一直等不到 Raw Input 时，必须有兜底，不能把回车弄丢。
+    """看门狗：**抬起确认迟迟不来**时的兜底，不能把回车弄丢。
+
+    🔴 v1.7：兜底起点从「按下」改成「抬起」——
+       人按住回车 0.5 秒很常见，v1.6 从按下算 400ms 就会误超时，
+       导致「还没松手就先把回车补出去了」。
 
     两条兜底路径：
       - 最近的活动来自遥控器 -> 当成遥控器按的（发发送快捷键）
@@ -320,7 +333,7 @@ def t_arbiter_timeout():
     M.title_matches = lambda hwnd, part: (not part) or ("workbuddy" in part.lower())
 
     app, hook = _make_sender_app()
-    app.send_confirm_ms = 0          # 让 pending 立刻过期
+    app.send_confirm_ms = 0          # 抬起之后立刻过期
     kb = M.KBDLLHOOKSTRUCT(M.VK_RETURN, 0x1C, 0, 0, 0)
     lp = ctypes.addressof(kb)
 
@@ -329,36 +342,42 @@ def t_arbiter_timeout():
     app.keys.calls = []
     app.keys.replays = []
     assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
     time.sleep(0.02)
     app.arbiter.tick()
     assert app.keys.calls == ["ctrl+enter"], app.keys.calls
     assert app.keys.replays == [], app.keys.replays
-    # 🔴 v1.6：抬起是「本次按住周期结束」的权威标志，必须抬一下，
-    #    否则下一次按下会被当成自动重复（真实硬件两次按下之间必有 keyup）
-    assert hook._on_key(0, M.WM_KEYUP, lp) == 1, "抬起没吞"
 
     # 6b) 遥控器很久没活动 -> 补发原键，不能凭空吞掉用户的回车
     app.remote_input = _FakeRawInput(60000)
     app.keys.calls = []
     app.keys.replays = []
     assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1
     time.sleep(0.02)
     app.arbiter.tick()
     assert app.keys.calls == [], app.keys.calls
     assert app.keys.replays == [(M.VK_RETURN, 0x1C, False)], app.keys.replays
-    assert hook._on_key(0, M.WM_KEYUP, lp) == 1, "抬起没吞"
 
-    # 6c) 超时之后才来的 Raw Input 不能让它再动作一次（不能双发）
-    app.remote_input = _FakeRawInput(60000)
+    # 6c) 超时之后才来的抬起确认不能让它再动作一次（不能双发）
+    before = (len(app.keys.calls), len(app.keys.replays))
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, True)
+    assert (len(app.keys.calls), len(app.keys.replays)) == before, \
+        "超时结算之后又来了一次动作（会双发）"
+
+    # 6d) 🔴 v1.7：按下之后、抬起之前，看门狗**不能**动
+    #     （人按住回车 0.5 秒很常见，从按下算就会误超时）
+    app.remote_input = _FakeRawInput(0)
     app.keys.calls = []
     app.keys.replays = []
     assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1
-    time.sleep(0.02)
+    time.sleep(0.05)
     app.arbiter.tick()
-    before = (len(app.keys.calls), len(app.keys.replays))
-    app.arbiter.on_raw_keydown(M.VK_RETURN, 0x1C, True)
-    assert (len(app.keys.calls), len(app.keys.replays)) == before, \
-        "超时结算之后又来了一次动作（会双发）"
+    assert app.keys.calls == [], "还没抬起就发了：%r" % (app.keys.calls,)
+    assert app.keys.replays == [], app.keys.replays
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, True)
+    assert app.keys.calls == ["ctrl+enter"], app.keys.calls
 
     import importlib
     importlib.reload(M)
@@ -420,11 +439,12 @@ def t_rawinput_layout():
 
 
 def t_arbiter_raw_confirm():
-    """端到端：钩子吞掉发送键 -> Raw Input 确认设备归属 -> 正确的动作。
+    """端到端：吞下 -> 放行抬起 -> 抬起那条 Raw Input 定性 -> 正确的动作。
 
-    这是 v1.5 修好之后的完整链路：
-      · Raw Input 说「是遥控器」-> 发 ctrl+enter（原键被替换掉）
-      · Raw Input 说「不是遥控器」-> 原样补发回车（绝不能让用户的回车消失）
+    这是 v1.7 的完整链路（替代 v1.5 的「等这一下的 Raw Input」——
+    那一版已被实测证伪：被吞的按键没有 Raw Input）：
+      · 抬起那条 Raw Input 说「是遥控器」-> 发 ctrl+enter（原键被替换掉）
+      · 说「不是遥控器」-> 原样补发回车（绝不能让用户的回车消失）
     """
     M.user32.GetForegroundWindow = lambda: 1
     M.title_matches = lambda hwnd, part: (not part) or ("workbuddy" in part.lower())
@@ -436,28 +456,35 @@ def t_arbiter_raw_confirm():
     # 7a) 遥控器按的 -> 发 ctrl+enter
     app.keys.calls = []
     app.keys.replays = []
-    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "发送键没被吞"
-    app._on_raw_key(M.VK_RETURN, 0x1C, True)
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "发送键的按下没被吞"
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, True)
     assert app.keys.calls == ["ctrl+enter"], app.keys.calls
     assert app.keys.replays == [], app.keys.replays
-    # 🔴 v1.6：抬起 = 本次按住周期结束（真实硬件两次按下之间必有 keyup）
-    assert hook._on_key(0, M.WM_KEYUP, lp) == 1, "配对的抬起没吞"
 
     # 7b) 实体键盘按的 -> 原样补发回车，不能被换成 ctrl+enter
     app.keys.calls = []
     app.keys.replays = []
-    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "发送键没被吞"
-    app._on_raw_key(M.VK_RETURN, 0x1C, False)
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "发送键的按下没被吞"
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, False)
     assert app.keys.calls == [], app.keys.calls
     assert app.keys.replays == [(M.VK_RETURN, 0x1C, False)], app.keys.replays
-    assert hook._on_key(0, M.WM_KEYUP, lp) == 1, "配对的抬起没吞"
 
-    # 7c) 遥控器按的、但配对的抬起也要吞
+    # 7c) 没有待确认的抬起 -> 不能凭空发（也不能凭空补）
+    app.keys.calls = []
+    app.keys.replays = []
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, True)
+    assert app.keys.calls == [], app.keys.calls
+    assert app.keys.replays == [], app.keys.replays
+
+    # 7d) 🔴 按下那条 Raw Input（被吞时根本不会有）来了也不能触发动作
     app.keys.calls = []
     app.keys.replays = []
     assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1
     app._on_raw_key(M.VK_RETURN, 0x1C, True)
-    assert hook._on_key(0, M.WM_KEYUP, lp) == 1, "配对的抬起没吞"
+    assert app.keys.calls == [], "按下的 Raw Input 不该触发发送：%r" % (app.keys.calls,)
+    assert app.keys.replays == [], app.keys.replays
 
     import importlib
     importlib.reload(M)
@@ -504,9 +531,9 @@ def t_send_key_hook():
     ksp = M.KBDLLHOOKSTRUCT(0x20, 0x39, 0, 0, 0)
     lp = ctypes.addressof(ksp)
     assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "空格没被吞下"
-    app.arbiter.on_raw_keydown(0x20, 0x39, True)
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
+    app.arbiter.on_raw_keyup(0x20, 0x39, True)
     assert app.keys.calls == ["ctrl+enter"], app.keys.calls
-    assert hook._on_key(0, M.WM_KEYUP, lp) == 1, "配对的抬起没吞"
 
     # 换成发送键以后，Enter 就不该再被拦
     app.keys.calls = []
@@ -518,6 +545,9 @@ def t_send_key_hook():
 
     import importlib
     importlib.reload(M)
+
+
+# ---------------- v1.7：注入回声必须丢弃 ----------------
 
 
 def t_remote_device_match():
@@ -597,17 +627,15 @@ def t_repeat_no_double():
     """🔴 回归测试：**按住 OK 键不放只能发一次**，不能连发。
 
     v1.5 的 bug：钩子每收到一次 keydown 就新增一条 pending。系统按住不放
-    会自动重复产生 ~30 次/秒的 keydown，于是 pending 堆成 6 条、
-    Raw Input 也来 6 次 -> **一次按住连发 6 次 ctrl+enter**。
-
-    v1.5 日志现场（17:32:49 / 17:36:03 连续 6 条）：
-        发送键已转换：Enter 回车 -> ctrl+enter（来源 raw）  x6
-
-    更糟的是看门狗和 Raw Input 各结算一部分 pending，会导致
-    **同一次按键既转换又补发**（双发，17:45:02 实测）。
+    会自动重复产生 ~30 次/秒的 keydown，于是 pending 堆成 6 条
+    -> **一次按住连发 6 次 ctrl+enter**（v1.5 日志 17:32:49 / 17:36:03
+    连续 6 条「发送键已转换（来源 raw）」就是现场）。
 
     v1.6：**一次「按下-松开」只对应一条 pending**；
     自动重复的 keydown 照吞（不能让真实回车漏到前台程序），但不新增 pending。
+
+    🔴 v1.7：判定改用**抬起**那条 Raw Input —— 抬起一次按键只有一次，
+       所以天然只会发一次（双保险）。
     """
     M.user32.GetForegroundWindow = lambda: 1
     M.title_matches = lambda hwnd, part: (not part) or ("workbuddy" in part.lower())
@@ -629,20 +657,19 @@ def t_repeat_no_double():
     assert len(live) == 1, \
         "🔴 按住不放时 pending 变成了 %d 条 -> 会连发" % len(live)
 
-    # Raw Input 也来 6 次（真实 down + 5 次 repeat）
-    for _ in range(6):
-        app._on_raw_key(M.VK_RETURN, 0x1C, True)
-
+    # 抬起放行 -> 它那条 Raw Input 到达 -> 只发一次
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, True)
     assert app.keys.calls == ["ctrl+enter"], \
         "🔴 按住不放应该只发一次，实际发了 %r" % (app.keys.calls,)
     assert app.keys.replays == [], app.keys.replays
 
     # 松开之后重新按一次 -> 应该再发一次（不是永久失效）
-    assert hook._on_key(0, M.WM_KEYUP, lp) == 1, "抬起应该被吞"
     app.keys.calls = []
     app.keys.replays = []
     assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "第二次按下应该被吞"
-    app._on_raw_key(M.VK_RETURN, 0x1C, True)
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, "抬起必须放行"
+    app._on_raw_keyup(M.VK_RETURN, 0x1C, True)
     assert app.keys.calls == ["ctrl+enter"], app.keys.calls
 
     import importlib
@@ -650,35 +677,49 @@ def t_repeat_no_double():
 
 
 def t_fallback_judge():
-    """看门狗兜底判据：遥控器 vs 实体键盘，要能分清。
+    """兜底判据：遥控器 vs 实体键盘，要能分清。
 
-    🔴 v1.5 的兜底判据只有一条：「30 秒内碰过遥控器 -> 就算遥控器按的」。
-    这会把**木木用实体键盘敲的回车**也误转成 ctrl+enter。
-
-    v1.6 加了第二条反向保护：最近一次「实体键盘按发送键」如果比
-    遥控器活动更近，就判成键盘（补发普通回车，不干预）。
-
-    ⚠️ 只看「按发送键」，不看「有没有键盘活动」——
-       木木打字用的是字母键，不该影响这个判定。
+    🔴 v1.7 判据换源：
+      v1.6 用「最近一次**实体键盘按发送键**的时刻」当反向证据 —— 不可靠：
+        实体键盘的回车**会被我们吞掉**，它自己那条 Raw Input 永远不会到，
+        所以那个时间戳只在「前置条件不满足、我们没吞」时才更新；
+        更致命的是 v1.6 把**自己注入的回声**（hdev=0）也当成了实体键盘按发送键
+        -> 污染判据 -> 第一次之后每一次都失败。
+      v1.7 改成「最近一次**任意**实体键盘活动」——
+        这只依赖**一定能看到**的事件（我们只吞 F5 重复和发送键按下，
+        字母键、空格、方向键这些 Raw Input 一定到）。
     """
     app, _hook = _make_sender_app()
     ri = _FakeRawInput(0)              # 遥控器刚刚活动过
-    ri.last_send_other_ts = 0.0
     app.remote_input = ri
-    assert app.remote_recently() is True, "刚用过遥控器 -> 应判为遥控器"
+    remote, why = app.send_key_verdict()
+    assert remote is True, "刚用过遥控器 -> 应判为遥控器（%s）" % why
 
-    # 木木用实体键盘按了回车（时间比遥控器活动更近）-> 不该判成遥控器
-    ri.last_send_other_ts = ri.last_activity + 0.001
-    assert app.remote_recently() is False, \
-        "🔴 实体键盘的回车被误判成遥控器了（会误转成 ctrl+enter）"
+    # 木木用实体键盘打了字（时间比遥控器活动更近）-> 不该判成遥控器
+    ri.last_physical_ts = ri.last_activity + 0.001
+    remote, why = app.send_key_verdict()
+    assert remote is False, \
+        "🔴 实体键盘活动被误判成遥控器了（会误转成 ctrl+enter）：%s" % why
 
     # 遥控器又活动了一次（明确晚于实体键盘那次）-> 重新判回遥控器
-    ri.last_activity = ri.last_send_other_ts + 0.001
-    assert app.remote_recently() is True, "遥控器活动更新后应判为遥控器"
+    ri.last_activity = ri.last_physical_ts + 0.001
+    remote, why = app.send_key_verdict()
+    assert remote is True, "遥控器活动更新后应判为遥控器（%s）" % why
 
     # 遥控器很久没活动 -> 不判
     ri.last_activity = time.time() - 60
-    assert app.remote_recently() is False, "遥控器太久没活动 -> 不该判为遥控器"
+    remote, why = app.send_key_verdict()
+    assert remote is False, "遥控器太久没活动 -> 不该判成遥控器"
+
+    # 从来没见过遥控器 -> 不判（不能瞎猜）
+    ri2 = _FakeRawInput(0)
+    ri2.last_activity = 0.0
+    app.remote_input = ri2
+    remote, why = app.send_key_verdict()
+    assert remote is False, "没见过遥控器活动就不该判成遥控器"
+
+    # 旧接口还在（兼容）
+    assert app.remote_recently() is False, "remote_recently 应与 verdict 一致"
 
 
 # ---------------- 遥控器语音键(F5)拦截 ----------------
@@ -783,6 +824,156 @@ def t_f5_swallow():
     assert hook._f5_state == 0, "抬起后状态应复位为 0"
 
 
+
+
+def _raw_keyboard_bytes_hdev(makecode, vkey, hdev, msg=0x0100, flags=0):
+    """带 hDevice 的 RAWKEYBOARD 字节（hdev=0 = 注入回声）。"""
+    b = bytearray(_raw_keyboard_bytes(makecode, vkey, msg, flags))
+    b[8:16] = int(hdev).to_bytes(8, "little")
+    return bytes(b)
+
+
+def _stub_get_raw_input(m, raw_bytes):
+    """把 user32.GetRawInputData 打桩成「返回这段真实布局的字节」。"""
+    def fake(hraw, cmd, buf, psize, cb):
+        n = len(raw_bytes)
+        if buf is None:
+            psize._obj.value = n
+            return 0
+        ctypes.memmove(buf, raw_bytes, n)
+        psize._obj.value = n
+        return n
+    m.user32.GetRawInputData = fake
+
+
+def t_hdev0_echo():
+    """🔴🔴 回归测试：**hdev=0 的注入回声必须被整个丢弃**。
+
+    这是 v1.6 的真 bug（也是「第一次能发、之后每次都发不出去」的根因）：
+
+      SendInput 注入的按键会产生 **hdev=0** 的 Raw Input 回声
+      （实测：注入 Alt / F5 / Enter 各产生 2 条 hdev=0 的 WM_INPUT）。
+      v1.6 把它当成「实体键盘按了发送键」-> 污染 `last_send_other_ts`
+      -> 「最近活动来自遥控器」永远判不成立
+      -> **第一次之后每一次按 OK 键都失败**。
+
+      19:03:51 实测现场：
+          发送键已转换：Enter 回车 -> ctrl+enter（来源 timeout）
+          Raw 其它设备按下发送键 vk=0x0D -> 不是遥控器，原样补发   ← 就是这个回声
+
+    v1.7：hdev==0 的事件**直接丢掉** —— 不更新时间戳、不通知仲裁器。
+    """
+    REMOTE_NAME = (r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_"
+                   r"VID&012717_PID&32B8_REV#9&2b876598&0&0000")
+    ri = M.RemoteInputWatcher(None, "2717")
+    seen = []
+    ri.on_keydown = lambda v, mk, hit: seen.append(("down", v, hit))
+    ri.on_keyup = lambda v, mk, hit: seen.append(("up", v, hit))
+
+    # 1) hdev=0（注入回声）-> 整个丢掉
+    raw0 = _raw_keyboard_bytes_hdev(0x1C, 0x0D, 0)
+    _stub_get_raw_input(M, raw0)
+    ri.last_activity = 0.0
+    ri.last_physical_ts = 0.0
+    hit = ri.handle(12345)
+    assert hit is False, "注入回声不该被当成遥控器"
+    assert ri.last_activity == 0.0, "🔴 注入回声污染了遥控器活动时间"
+    assert ri.last_physical_ts == 0.0, "🔴 注入回声污染了实体键盘活动时间"
+    assert seen == [], "🔴 注入回声被当成了真实按键事件：%r" % (seen,)
+    assert ri.echo_count == 1, "注入回声计数不对：%s" % ri.echo_count
+
+    # 2) 真实设备（遥控器）-> 正常处理，更新遥控器活动时间
+    ri2 = M.RemoteInputWatcher(None, "2717")
+    ri2._read_names = lambda h: [REMOTE_NAME]
+    seen2 = []
+    ri2.on_keydown = lambda v, mk, hit: seen2.append(("down", v, hit))
+    _stub_get_raw_input(M, _raw_keyboard_bytes_hdev(0x1C, 0x0D, 7))
+    hit = ri2.handle(12345)
+    assert hit is True, "遥控器设备没认出来"
+    assert ri2.last_activity > 0.0, "遥控器活动时间没更新"
+    assert ri2.last_physical_ts == 0.0, "遥控器活动不该记到实体键盘头上"
+    assert seen2 and seen2[0][0] == "down", seen2
+
+    # 3) 实体键盘 -> 更新实体键盘活动时间，不动遥控器那边
+    ri3 = M.RemoteInputWatcher(None, "2717")
+    ri3._read_names = lambda h: [r"\\?\HID#VID_046D&PID_C31C&MI_00#8&2a3b4c5d&0&0000"]
+    _stub_get_raw_input(M, _raw_keyboard_bytes_hdev(0x1E, 0x41, 9))
+    hit = ri3.handle(12345)
+    assert hit is False, "普通键盘不该被当成遥控器"
+    assert ri3.last_physical_ts > 0.0, "实体键盘活动时间没更新"
+    assert ri3.last_activity == 0.0, "实体键盘活动不该记到遥控器头上"
+
+    # 4) 抬起事件也要处理（v1.7 的判定就靠它）
+    ri4 = M.RemoteInputWatcher(None, "2717")
+    ri4._read_names = lambda h: [REMOTE_NAME]
+    ups = []
+    ri4.on_keyup = lambda v, mk, hit: ups.append((v, hit))
+    _stub_get_raw_input(M, _raw_keyboard_bytes_hdev(0x1C, 0x0D, 7,
+                                                     msg=0x0101))
+    ri4.handle(12345)
+    assert ups and ups[0][0] == 0x0D, "抬起事件没被送到 on_keyup：%r" % (ups,)
+    assert ups[0][1] is True, "抬起事件的设备归属判错了"
+
+    import importlib
+    importlib.reload(M)
+
+
+def t_activity_split():
+    """🔴 回归测试：遥控器活动与实体键盘活动**分开记**，互不污染。
+
+    v1.6 只有 `last_activity` 一个字段，实体键盘与遥控器混在一起，
+    再加上注入回声的污染，判据就彻底失灵了。
+
+    v1.7 拆成两个字段：
+      last_activity     —— 最近一次**遥控器**按键
+      last_physical_ts  —— 最近一次**实体键盘**按键
+    「谁更近谁说了算」才有意义。
+    """
+    ri = M.RemoteInputWatcher(None, "2717")
+    assert ri.last_activity == 0.0
+    assert ri.last_physical_ts == 0.0
+
+    REMOTE_NAME = (r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_"
+                   r"VID&012717_PID&32B8_REV#9&2b876598&0&0000")
+    ri._read_names = lambda h: [REMOTE_NAME]
+    _stub_get_raw_input(M, _raw_keyboard_bytes_hdev(0x1C, 0x0D, 7))
+    ri.handle(12345)
+    t_remote = ri.last_activity
+    assert t_remote > 0.0, "遥控器活动时间没更新"
+    assert ri.last_physical_ts == 0.0, "遥控器活动不该污染实体键盘时间"
+
+    import importlib
+    importlib.reload(M)
+
+
+def t_up_passthrough():
+    """🔴 回归测试：发送键的**抬起必须放行**（v1.7 架构的地基）。
+
+    实测（tools\\probe_raw_live.py swallow，2026-10-30）：
+        放行(对照)    WM_INPUT 3 条
+        全吞(下+抬)   WM_INPUT 0 条   <- 被吞的按键没有 Raw Input
+        只吞按下      WM_INPUT 1 条   <- 抬起照样到！
+
+    所以「吞下、放开抬」是拿到**确定**设备归属的唯一办法。
+    这条测试把「抬起被吞」这种改法直接判死。
+    """
+    M.user32.GetForegroundWindow = lambda: 1
+    M.title_matches = lambda hwnd, part: (not part) or ("workbuddy" in part.lower())
+
+    app, hook = _make_sender_app()
+    kb = M.KBDLLHOOKSTRUCT(M.VK_RETURN, 0x1C, 0, 0, 0)
+    lp = ctypes.addressof(kb)
+
+    assert hook._on_key(0, M.WM_KEYDOWN, lp) == 1, "按下应该被吞"
+    assert hook._on_key(0, M.WM_KEYUP, lp) != 1, \
+        "🔴 抬起被吞了 —— v1.7 的判定链路就断了"
+
+    # 抬起放行后，pending 必须被标记成「抬起已发生」，等 Raw Input 来定性
+    pend = app.arbiter._pending[-1]
+    assert pend["up_ts"] is not None, "抬起没有标记到 pending 上"
+
+    import importlib
+    importlib.reload(M)
 def main():
     print("MiVoice 回归测试")
     print("=" * 60)
@@ -806,6 +997,9 @@ def main():
     check("OK 键：看门狗兜底判据", t_fallback_judge)
     check("发送键：名称解析", t_send_key_parse)
     check("发送键：可换成任意键", t_send_key_hook)
+    check("OK 键：注入回声必须丢弃", t_hdev0_echo)
+    check("OK 键：遥控器/实体键盘活动分开记", t_activity_split)
+    check("OK 键：抬起必须放行", t_up_passthrough)
     check("F5 拦截（遥控器语音键）", t_f5_swallow)
     print("=" * 60)
     print("通过 %d / %d" % (len(PASS), len(PASS) + len(FAIL)))

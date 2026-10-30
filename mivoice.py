@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-遥控语音 (MiVoice) v1.6
+遥控语音 (MiVoice) v1.7
 =======================
 把「小米蓝牙语音遥控器」（RC003 同款，VID 0x2717 / PID 0x32B8）的语音键，
 变成 WorkBuddy 对话框的语音输入。
@@ -9,6 +9,7 @@
   1. 点进 WorkBuddy 的输入框（让光标在对话框里）
   2. 按住遥控器语音键，说话
   3. 松手 -> WorkBuddy 自动转写，文字出现在输入框里
+  4. 按遥控器 OK 键 -> 变成 Ctrl+Enter -> 发送
 
 原理：
   按住语音键 -> 遥控器经 BLE ATVV 协议推麦克风音频
@@ -22,6 +23,24 @@
 为什么不碰 F5：
   语音键在 Windows 上同时表现为键盘 F5。全局改 F5 会把实体键盘的 F5（刷新）
   一起改掉，所以本程序完全不拦键盘，只用 ATVV 音频会话的起止当扳机。
+
+🔴 v1.7 的架构革新：「吞掉按下、放开抬起」
+  v1.3~v1.6 一直用「钩子先吞 -> 等 Raw Input 确认设备归属 -> 决定发送还是补发」。
+  🔴 这条链**在 Windows 上根本不成立**（2026-10-30 实测钉死）：
+      被低级键盘钩子吞掉的按键，**Raw Input 一条都不会到**。
+      探针实测：放行 3 条 / 全吞 0 条；
+      日志印证：19:03 那 265 条被吞的 F5 重复，主日志零条 Raw Input。
+  ✅ v1.7 的新办法（同样实测钉死）：
+      **只吞「按下」，把「抬起」放行** —— 抬起那一条 Raw Input 照样会到，
+      而它带的 hDevice 就是**这一下按键的确定设备归属**。
+      于是：
+        按下 -> 吞掉（前台程序收不到，不会插入换行）
+        抬起 -> 放行 -> Raw Input 到达 -> 拿到 hDevice
+             -> 是遥控器 -> 发 ctrl+enter
+             -> 是别的设备 -> 把刚才吞掉的按下**补发**回去
+  另外还修了 v1.6 的一个真 bug：SendInput 注入的按键会产生 hdev=0 的
+  Raw Input 回声，v1.6 把它当成「实体键盘按了发送键」，污染判据，
+  导致**第一次之后每一次都失败**。v1.7 直接丢弃 hdev=0 的事件。
 
 前置条件（一次性）：
   - 安装 VB-CABLE 虚拟声卡（管理员 + 重启一次）
@@ -54,7 +73,7 @@ import traceback
 # 0. 基本路径 / 日志
 # ===========================================================================
 APP_NAME = "遥控语音"
-APP_VER = "1.6"
+APP_VER = "1.7"
 HERE = os.path.dirname(os.path.abspath(__file__))
 INI_PATH = os.path.join(HERE, "mivoice.ini")
 LOG_PATH = os.path.join(HERE, "mivoice.log")
@@ -650,11 +669,14 @@ DEFAULTS = {
         "send_key": "enter",
         "remote_active_ms": "10000",  # 原始事件没等到时的兜底窗口：最近多少毫秒内
                                       # 有遥控器活动，就认为这一下是遥控器按的
-        "send_fallback_ms": "30000", # 看门狗兜底窗口（专用）。Raw Input 迟迟不来时，
+        "send_fallback_ms": "30000", # 看门狗兜底窗口（专用）。抬起确认迟迟不来时，
                                       # 「最近 30 秒内用过遥控器」就算遥控器按的。
                                       # 🔴 用它而不是 remote_active_ms：说话到按 OK 键
                                       #    间隔经常超过 10 秒，窗口太紧会漏判。
-        "send_confirm_ms": "400",    # 吞掉发送键后，等多久去问 Raw Input「谁按的」
+        "send_confirm_ms": "800",    # 🔴 v1.7：抬起之后等多久去问「抬起那条 Raw Input
+                                      #    到了没」。实测是毫秒级到达的，800ms 只是保险丝。
+                                      #    （v1.6 的 400 是从「按下」算起，人按住回车
+                                      #      稍久一点就会误超时，所以 v1.7 改成从抬起算起。）
         "hide_remote_f5": "1",        # 1 = 藏掉遥控器语音键(F5)，否则 WorkBuddy 会误判成组合键
         "hotkey_quit": "Ctrl+Shift+M",  # 退出热键（实测 Ctrl+Alt+M/V/O/Q/X/Z/L 已被占用）
         "autostart": "0",             # 开机自启（托盘菜单可切，会写回本文件）
@@ -1477,17 +1499,37 @@ class RemoteInputWatcher:
     """用 Raw Input 监听键盘事件，认出「这一下是遥控器按的」。
 
     低级键盘钩子拿不到设备信息，Raw Input 的 WM_INPUT 带 hDevice，可以解析
-    出设备路径（含 VID&012717）。它不能拦截按键，只用来记录「遥控器最近
-    活动时间」——钩子再据此判断某个 Enter 是不是遥控器发的。
+    出设备路径（含 VID&012717）。它不能拦截按键，只用来回答一个问题：
+    **这一下按键，到底是哪个设备按的？**
+
+    🔴 v1.7 架构核心（全部经实测钉死，2026-10-30）：
+
+      1. **被低级键盘钩子吞掉的按键，Raw Input 一条都不会到。**
+         探针实测：放行 3 条 / 全吞 0 条。
+         —— 所以 v1.3~v1.6 的「吞掉 -> 等 Raw Input 确认」永远走不通。
+
+      2. **但只要「抬起」被放行，抬起那一条 Raw Input 照样会到**，
+         而它带的 hDevice 就是这一下按键的**确定**设备归属。
+         —— 所以 v1.7 改成「吞下、放开抬」，用抬起事件做判定。
+
+      3. **SendInput 注入的按键会产生 hdev=0 的 Raw Input 回声。**
+         那是「我们自己注入的」，绝不能当成「实体键盘按了发送键」
+         （v1.6 就栽在这，污染判据 -> 第一次之后每次都失败）。
+         —— v1.7 直接丢弃 hdev==0 的事件。
     """
 
     def __init__(self, hwnd, match: str = "2717", on_activity=None,
-                 on_keydown=None):
+                 on_keydown=None, on_keyup=None):
         self.hwnd = hwnd
         self.match = (match or "").strip().lower()
         self.on_activity = on_activity
         self.on_keydown = on_keydown
+        self.on_keyup = on_keyup
+        # 最近一次**遥控器**按键的时刻
         self.last_activity = 0.0
+        # 🔴 v1.7：最近一次**实体键盘**按键的时刻。
+        #    用来判断「刚才那一下更可能是谁按的」—— 这是时间窗兜底的第二条判据。
+        self.last_physical_ts = 0.0
         self._dev_cache = {}
         self._seen = set()
         # 🔴 v1.6：读不出设备名的 hDevice（只提醒一次，别刷屏）
@@ -1496,6 +1538,11 @@ class RemoteInputWatcher:
         self._remote_hdevs = set()
         # 🔴 v1.6：最近一次**实体键盘**按发送键的时刻（看门狗兜底判据用）
         self.last_send_other_ts = 0.0
+        # 🔴 v1.7：注入回声 / 解析失败的计数（原来静默 return False，查无实据）
+        self.echo_count = 0
+        self.drop_count = 0
+        self._echo_logged = False
+        self._drop_logged = False
         self.registered = False
 
     def register(self) -> bool:
@@ -1609,28 +1656,61 @@ class RemoteInputWatcher:
         return hit
 
     def handle(self, lparam) -> bool:
-        """在 WM_INPUT 里调用。返回 True 表示这次事件来自遥控器。"""
+        """在 WM_INPUT 里调用。返回 True 表示这次事件来自遥控器。
+
+        🔴 v1.7 的三处关键改动：
+
+        1. **hdev == 0 的事件直接丢弃** —— 那是 SendInput 注入的回声，
+           是「我们自己发的」，不是任何人的手。
+           🔴 v1.6 的真 bug 就栽在这：注入回声被当成「实体键盘按了发送键」，
+           污染 `last_send_other_ts` -> 「最近活动来自遥控器」永远判不成立
+           -> **第一次之后每一次按 OK 键都失败**（19:03:51 实测现场）。
+
+        2. **抬起事件也要处理** —— v1.7 的整套判定就靠抬起那一条 Raw Input。
+           按下被钩子吞了不会有 Raw，抬起放行了才有。
+
+        3. **解析失败不再静默** —— 原来三处 `return False` 什么都不记，
+           洪峰丢包时完全查不出原因。现在计数 + 打一条正式日志。
+        """
         try:
             size = wt.UINT(0)
             hraw = wt.HANDLE(lparam)
-            if user32.GetRawInputData(hraw, RID_INPUT, None, ctypes.byref(size), 24) != 0:
+            if user32.GetRawInputData(hraw, RID_INPUT, None,
+                                      ctypes.byref(size), 24) != 0:
+                self._note_drop("GetRawInputData 第一次调用失败")
                 return False
             if not size.value:
+                self._note_drop("GetRawInputData 返回 0 字节")
                 return False
             buf = ctypes.create_string_buffer(size.value)
-            if user32.GetRawInputData(hraw, RID_INPUT, buf, ctypes.byref(size), 24) == 0xFFFFFFFF:
+            if user32.GetRawInputData(hraw, RID_INPUT, buf,
+                                      ctypes.byref(size), 24) == 0xFFFFFFFF:
+                self._note_drop("GetRawInputData 读取失败")
                 return False
             raw = buf.raw
             if struct_unpack_i(raw, 0) != RIM_TYPEKEYBOARD:
                 return False
             hdev = struct_unpack_q(raw, 8)
+            # 🔴🔴 v1.7：注入回声必须在这里挡掉（实测：SendInput 注入的按键
+            #    会产生 hdev=0 的 Raw Input）。放行它 = 自己污染自己的判据。
+            if hdev == 0:
+                self.echo_count += 1
+                if not self._echo_logged:
+                    self._echo_logged = True
+                    log("Raw Input：忽略 hdev=0 的注入回声（我们自己 SendInput "
+                        "注入的按键，不是任何设备按的）")
+                return False
             # 🔴 MakeCode / VKey 都是 USHORT，必须读 2 字节（详见 struct_unpack_h）
             makecode = struct_unpack_h(raw, 24)     # RAWKEYBOARD.MakeCode
             vkey = struct_unpack_h(raw, 30)         # RAWKEYBOARD.VKey
             msg = struct_unpack_i(raw, 32)          # RAWKEYBOARD.Message
-            if msg not in (WM_KEYDOWN, WM_SYSKEYDOWN):
+            is_down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
+            is_up = msg in (WM_KEYUP, WM_SYSKEYUP)
+            if not (is_down or is_up):
                 return False
             hit = self.is_remote(hdev)
+            # 活动时间：遥控器和实体键盘**分别**记，谁更近谁说了算。
+            # 🔴 v1.7：抬起也记 —— 遥控器的语音键抬起，说明它刚被用过。
             if hit:
                 self.last_activity = time.time()
                 if self.on_activity:
@@ -1638,16 +1718,33 @@ class RemoteInputWatcher:
                         self.on_activity()
                     except Exception:
                         pass
+            else:
+                self.last_physical_ts = time.time()
             # 把「这一下是哪个设备按的」告诉仲裁器 —— 只有这里能分清设备
-            if self.on_keydown:
+            if is_down and self.on_keydown:
                 try:
                     self.on_keydown(vkey, makecode, hit)
+                except Exception:
+                    pass
+            elif is_up and self.on_keyup:
+                try:
+                    self.on_keyup(vkey, makecode, hit)
                 except Exception:
                     pass
             return hit
         except Exception as e:
             dbg("WM_INPUT 解析异常: %r" % (e,))
             return False
+
+    def _note_drop(self, why: str):
+        """记一笔「这次 Raw Input 没解析出来」，别再静默吞掉。"""
+        self.drop_count += 1
+        if not self._drop_logged:
+            self._drop_logged = True
+            log("Raw Input：%s（已丢弃，之后每 50 次再记一次）" % why)
+        elif self.drop_count % 50 == 0:
+            log("Raw Input：累计丢弃 %d 条（最后一次：%s）"
+                % (self.drop_count, why))
 
 
 def struct_unpack_i(buf, off):
@@ -1674,33 +1771,36 @@ def struct_unpack_q(buf, off):
 class SendArbiter:
     """发送键仲裁器：把遥控器的 OK 键变成发送快捷键，同时绝不误伤实体键盘。
 
-    🔴 为什么必须有仲裁器（这是 v1.3 一直不生效的**根本原因**）：
+    🔴🔴🔴 v1.7 架构翻新（本次的**真根因修复**，三条全部经实测钉死）：
 
-      1. 低级键盘钩子（WH_KEYBOARD_LL）是**同步先跑**的；
-         Raw Input 的 WM_INPUT 是**异步后处理**的。
-      2. 遥控器的 OK 键在 Windows 上就是一个**普通 Enter**
-         （实测 vk=0x0D, scan=0x1C, flags=0x00），跟实体键盘的 Enter
-         **完全同码** —— 钩子里只看 vk / scan / flags **分不出是谁按的**，
-         只有 Raw Input 的 hDevice 能分。
-      3. 于是 v1.3 用的「遥控器最近 3000ms 内活动过」这种时间窗判据，
-         在「按下 OK 键的这一刻」必然是**过期**的（这一下自己的 Raw Input
-         还没被处理），所以**第一次按 OK 键 100% 不转换**。
+      v1.3~v1.6 用的链路是：
+          钩子先吞 -> 等 Raw Input 确认设备归属 -> 决定发送还是补发
 
-    现在的做法（先吞 -> 异步按设备确认 -> 不对就补发）：
+      🔴 这条链**在 Windows 上根本不成立**：
+          **被低级键盘钩子吞掉的按键，Raw Input 一条都不会到。**
+          探针实测（tools\\probe_raw_live.py swallow）：
+              放行(对照)    WM_INPUT 3 条
+              全吞(下+抬)   WM_INPUT 0 条
+          日志印证：19:03 那 265 条被吞的 F5 重复，主日志**零条** Raw Input。
+          所以「等 Raw Input 确认自己」永远等不到；v1.4/v1.5 日志里的
+          「来源 raw」其实是**别的**未吞按键的事件被 FIFO 误配出来的。
 
-      1. 钩子（同步）：命中发送键 + 前置条件满足
-         （前台窗口是 WorkBuddy / 没有修饰键按着 / 输入法没在组词）
-         -> **先吞掉**这一下，同时登记一条 pending；
-      2. Raw Input（异步）：同一 vk 的原始事件到了，看 hDevice 是不是遥控器
-         - 是遥控器 -> 发 send_keys（默认 ctrl+enter），pending 结算；
-         - 不是    -> 把刚才吞掉的按键**原样补发**回去（用户只晚几毫秒，
-                     完全无感），pending 结算；
-      3. 看门狗：pending 超过 confirm_ms 还没等到 Raw Input
-         -> 说明这次吞键把原始事件也挡住了，退而求其次：
-            最近一次原始键盘事件来自遥控器 -> 当成遥控器按的（转换）；
-            否则 -> 补发回去。
+      ✅ v1.7 的新链路（同样实测钉死）：
+          **只吞「按下」，把「抬起」放行** —— 抬起那一条 Raw Input 照样会到，
+          而它带的 hDevice 就是**这一下按键的确定**设备归属。
 
-    ⚠️ 补发（replay）是安全网的关键：宁可「晚 10ms 送达」，
+            按下 -> 吞掉（前台程序收不到，不会插入换行）
+            抬起 -> 放行 -> Raw Input 到达 -> 拿到 hDevice
+                 -> 是遥控器 -> 发 send_keys（默认 ctrl+enter）
+                 -> 是别的设备 -> 把刚才吞掉的按下**原样补发**回去
+
+      ⚠️ 因此本类**故意打破**「吞了按下就必须吞抬起」的配对原则：
+         发送键的抬起**必须放行**，否则拿不到设备归属。
+         代价 = 前台程序会收到一个「没有按下过的抬起」—— 对输入框无害
+         （不会插入任何字符），换来的是**确定**的判定。
+         （F5 语音键那边仍然保持配对原则，是另一条逻辑，不冲突。）
+
+    ⚠️ 补发（replay）是安全网的关键：宁可「晚几毫秒送达」，
        也不能让用户的回车凭空消失。
     """
 
@@ -1712,6 +1812,12 @@ class SendArbiter:
     #    取 300ms：远大于系统最快重复速率（约 33ms/次），
     #    也远小于人「松开再按」的正常间隔（>100ms）。
     REPEAT_GAP = 0.300
+    # 🔴 v1.7：抬起之后等多久去问「抬起那条 Raw Input 到了没」。
+    #    实测抬起事件是毫秒级到达的，800ms 只是保险丝。
+    CONFIRM_WAIT_MS = 800
+    # 🔴 v1.7：按下之后多久还没等到抬起 -> 认定抬起丢了，走时间窗兜底。
+    #    人按住回车一般 <1s；3s 足够宽松，又不至于让 pending 无限挂着。
+    HOLD_TIMEOUT_MS = 3000
 
     def __init__(self, app):
         self.app = app
@@ -1721,7 +1827,7 @@ class SendArbiter:
         self._cycle_vk = 0          # 本次「按住周期」正在吞的 vk
         self._cycle_ts = 0.0        # 本周期最后一次 down 的时刻
         self.stats = {"sent": 0, "replayed": 0, "timeout": 0, "dropped": 0,
-                      "repeat": 0}
+                      "repeat": 0, "up_raw": 0}
 
     # ---------------- 钩子侧（同步，必须快：不写日志、不阻塞） ----------------
     def on_hook_down(self, kb) -> bool:
@@ -1730,17 +1836,13 @@ class SendArbiter:
         🔴 v1.6 关键修复：**按住不放不能连发！**
 
         旧版每来一次 keydown 就新增一条 pending。系统按住不放会自动重复
-        产生几十次/秒的 keydown，于是 pending 堆成 6 条，Raw Input 也来 6 次，
+        产生几十次/秒的 keydown，于是 pending 堆成 6 条，
         结果就是**一次按住连发 6 次 ctrl+enter**（v1.5 日志 17:32:49 / 17:36:03
         连续 6 条「发送键已转换（来源 raw）」就是现场）。
 
-        更糟的是：看门狗和 Raw Input 各结算一部分 pending，会导致
-        **同一次按键既转换又补发**（双发）—— v1.5 日志 17:45:02 先
-        「发送键已转换（来源 timeout）」又「补发原键（来源 raw）」。
-
         ✅ v1.6：**一次「按下-松开」只对应一条 pending**。
         自动重复的 keydown 照吞（不能让真实回车漏到前台程序），
-        但不再新增 pending —— 这样无论 Raw Input 来几次，最终只发一次。
+        但不再新增 pending。
 
         ⚠️ 怎么区分「按住不放的自动重复」和「松开后再按一次」？
            **靠 keyup**：系统的自动重复**不产生 keyup**，人的两次独立按键
@@ -1748,6 +1850,10 @@ class SendArbiter:
              · on_hook_up  -> 清掉 _cycle_vk（本次按住周期结束）
              · on_hook_down -> 若 _cycle_vk 仍是同一个 vk，就是自动重复
            时间阈值 REPEAT_GAP 只兜底「keyup 丢失」，不是主要判据。
+
+        🔴 v1.7：**无条件吞掉按下**（前置条件满足时）。
+           因为「抬起」那一条 Raw Input 会给出**确定**的设备归属，
+           吞下去也不会丢信息；万一判成实体键盘，回车会被**原样补发**回来。
         """
         try:
             if not self.app.ok_precheck():
@@ -1769,6 +1875,7 @@ class SendArbiter:
                     "scan": kb.scanCode,
                     "ext": bool(kb.flags & 0x01),   # LLKHF_EXTENDED
                     "ts": now,
+                    "up_ts": None,     # 🔴 v1.7：抬起发生的时间（钩子看到时填）
                     "done": False,
                 })
                 if len(self._pending) > self.MAX_PENDING:
@@ -1779,64 +1886,107 @@ class SendArbiter:
             return False
 
     def on_hook_up(self, kb) -> bool:
-        """钩子收到发送键 keyup。返回 True = 吞掉这一下（跟吞掉的 down 配对）。"""
+        """钩子收到发送键 keyup。
+
+        🔴🔴 v1.7：**放行抬起**（永远返回 False），这是新架构的关键。
+
+        为什么必须放行：
+          按下被吞掉 -> 没有 Raw Input -> 拿不到这一下的设备归属；
+          抬起放行     -> 抬起那条 Raw Input 会到 -> hDevice 就是答案。
+
+        ⚠️ 这**故意打破**「吞了按下就要吞抬起」的配对原则。
+           代价：前台程序会收到一个「没有按下过的抬起」。
+           对普通输入框无害（不会插入任何字符），换来的是**确定的**设备判定。
+
+        同时在这里给 pending 打上「抬起已发生」的时间戳，
+        看门狗据此判断「抬起确认迟迟不来」。
+        """
         try:
             with self._lock:
                 if self._up_vk == kb.vkCode:
                     self._up_vk = 0
                     self._cycle_vk = 0       # 本次按住周期结束
-                    return True
-            return False
+                    # 标记「抬起已经发生」，等它那条 Raw Input 来定性
+                    for p in reversed(self._pending):
+                        if not p["done"] and p["up_ts"] is None:
+                            p["up_ts"] = time.time()
+                            break
+            return False                # ← 放行抬起（v1.7）
         except Exception:
             return False
 
     # ---------------- Raw Input 侧（异步，主线程） ----------------
     def on_raw_keydown(self, vkey: int, makecode: int, is_remote: bool) -> bool:
-        """原始键盘事件到了。返回 True = 这次事件被仲裁器消费了。"""
+        """按下的原始事件到了。
+
+        🔴 v1.7：按下被吞时**根本不会有**这条事件（实测：全吞 0 条），
+        所以这里收到的一定是「我们没吞的那一下」（前置条件不满足），
+        没有 pending 可结算 -> 原样放行即可。
+        保留这个方法是为了不打断 App 的调用链。
+        """
+        return False
+
+    def on_raw_keyup(self, vkey: int, makecode: int, is_remote: bool) -> bool:
+        """🔴🔴 v1.7 主路径：**抬起**那条 Raw Input 到了 -> 设备归属**确定**。
+
+        这一步是整套新架构的落点：
+          抬起被放行，所以 Raw Input 一定会到；
+          它带的 hDevice 就是**这一下按键**按下去的设备。
+        """
         try:
             if vkey != self.app.send_key_vk:
                 return False
             with self._lock:
                 pend = None
                 for p in self._pending:
-                    if not p["done"]:
+                    if (not p["done"]) and p["up_ts"] is not None:
                         pend = p
                         break
                 if pend is None:
-                    # 没有 pending -> 这一下我们没吞（前置条件不满足），原样放行
                     return False
                 pend["done"] = True
+            self.stats["up_raw"] += 1
             if is_remote:
-                self._do_send("raw")
+                self._do_send("up")
             else:
-                self._do_replay(pend, "raw")
+                self._do_replay(pend, "up")
             return True
         except Exception:
             return False
 
     # ---------------- 看门狗（主线程定时器） ----------------
     def tick(self):
-        """检查有没有 pending 超时（没等到 Raw Input）。"""
+        """抬起那条 Raw Input 迟迟不来时的兜底（按时间窗猜）。"""
         try:
             now = time.time()
-            limit = self.app.send_confirm_ms / 1000.0
+            confirm = self.app.send_confirm_ms / 1000.0
+            hold = self.HOLD_TIMEOUT_MS / 1000.0
             overdue = []
             with self._lock:
                 for p in self._pending:
-                    if not p["done"] and (now - p["ts"]) > limit:
+                    if p["done"]:
+                        continue
+                    if p["up_ts"] is not None:
+                        # 抬起发生了，但那条 Raw Input 没来 -> 超时兜底
+                        if (now - p["up_ts"]) > confirm:
+                            p["done"] = True
+                            overdue.append(p)
+                    elif (now - p["ts"]) > hold:
+                        # 抬起压根没来（丢了 / 用户一直按着）-> 超时兜底
                         p["done"] = True
                         overdue.append(p)
                 if len(self._pending) > self.MAX_PENDING:
                     self._pending = [p for p in self._pending if not p["done"]][-4:]
             for p in overdue:
                 self.stats["timeout"] += 1
-                if self.app.remote_recently():
-                    # 没等到原始事件，但最近的活动确实来自遥控器 -> 当成遥控器按的
-                    log("看门狗兜底：等不到 Raw Input，按「遥控器」处理 -> 发 %s"
-                        % self.app.send_spec)
+                remote, why = self.app.send_key_verdict()
+                if remote:
+                    log("看门狗兜底：抬起确认没等到（%s）-> 按「遥控器」处理 -> 发 %s"
+                        % (why, self.app.send_spec))
                     self._do_send("timeout")
                 else:
-                    log("看门狗兜底：等不到 Raw Input，按「实体键盘」处理 -> 补发原键")
+                    log("看门狗兜底：抬起确认没等到（%s）-> 按「实体键盘」处理 -> 补发原键"
+                        % why)
                     self._do_replay(p, "timeout")
         except Exception:
             pass
@@ -1863,7 +2013,6 @@ class SendArbiter:
             self.stats["dropped"] += 1
             log("！！补发按键失败，用户这一下回车可能丢了: %r" % (e,))
 
-
 class EnterSendHook:
     """低级键盘钩子，做两件事：
 
@@ -1877,10 +2026,14 @@ class EnterSendHook:
     判定链（任何一条不满足就原样放行）：
       1. 总开关 ok_to_send + 程序未暂停
       2. 前台窗口标题匹配（默认 WorkBuddy）
-      3. 遥控器最近有活动（Raw Input 记录，默认 3 秒内）
-      4. 输入法没有在组词（否则 Enter 要留给输入法选词）
-      5. 当前没有任何修饰键按下（用户自己按 Ctrl+Enter 时不干预）
-      6. 事件不是本程序注入的（LLKHF_INJECTED，防递归）
+      3. 输入法没有在组词（否则 Enter 要留给输入法选词）
+      4. 当前没有任何修饰键按下（用户自己按 Ctrl+Enter 时不干预）
+      5. 事件不是本程序注入的（LLKHF_INJECTED，防递归）
+
+    🔴 v1.7：**发送键的「抬起」是故意放行的**（不是漏放）。
+      按下被吞 -> 没有 Raw Input -> 拿不到设备归属；
+      抬起放行 -> 抬起那条 Raw Input 会到 -> hDevice 就是这一下的确定设备。
+      详见 SendArbiter 的类文档。
 
     ⚠️ 钩子跑在独立线程里，且回调里绝不写日志/不调可能阻塞的 API：
       低级钩子一旦卡住，整个系统的键盘都会停止响应。所以输入法状态由
@@ -1969,16 +2122,21 @@ class EnterSendHook:
                 swallowed = self._handle_f5(wParam, kb)
                 if swallowed:
                     tag = "SWAL"
-                # 发送键交给仲裁器：先吞掉，等 Raw Input 告诉我是谁按的
+                # 发送键交给仲裁器：吞掉「按下」，放行「抬起」
                 elif (self.app.arbiter is not None
                         and kb.vkCode == self.app.send_key_vk
                         and not (kb.flags & LLKHF_INJECTED)):
                     if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                         swallowed = self.app.arbiter.on_hook_down(kb)
+                        if swallowed:
+                            tag = "SND"
                     elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+                        # 🔴🔴 v1.7：抬起**必须放行**！
+                        #    抬起放行 -> 抬起那条 Raw Input 才会到 ->
+                        #    它的 hDevice 就是这一下按键的**确定**设备归属。
+                        #    （v1.3~v1.6 一直吞抬起，所以永远拿不到 Raw Input。）
                         swallowed = self.app.arbiter.on_hook_up(kb)
-                    if swallowed:
-                        tag = "SND"
+                        tag = "UPE"       # 抬起放行 -> Raw Input 会到
                 self._record_key(wParam, kb, swallowed, tag)
                 if swallowed:
                     return 1
@@ -2344,10 +2502,10 @@ class App:
             self.send_key_spec = "enter"
         self.send_key_name = vk_label(self.send_key_vk)
         self.remote_active_ms = self.cfg.i("general", "remote_active_ms")
-        # 看门狗兜底窗口：Raw Input 没在 send_confirm_ms 内到达时，
+        # 看门狗兜底窗口：抬起那条 Raw Input 迟迟不来时，
         # 「最近 send_fallback_ms 毫秒内用过遥控器」就当成遥控器按的。
         self.send_fallback_ms = max(1000, self.cfg.i("general", "send_fallback_ms"))
-        # 吞掉发送键之后，等多久去问 Raw Input「这一下到底是谁按的」。
+        # 🔴 v1.7：抬起之后等多久去问「抬起那条 Raw Input 到了没」。
         # 超时了就按「最近活动来自遥控器」兜底，并补发原键。
         self.send_confirm_ms = max(50, self.cfg.i("general", "send_confirm_ms"))
         # 1 = 录音期间吞掉遥控器的 F5（见 EnterSendHook._handle_f5）
@@ -2429,14 +2587,18 @@ class App:
             self.remote_input = RemoteInputWatcher(
                 self.host, self.cfg.s("general", "device_match"),
                 on_activity=self._on_remote_activity,
-                on_keydown=self._on_raw_key)
+                on_keydown=self._on_raw_key,
+                on_keyup=self._on_raw_keyup)
             self.remote_input.register()
             self.ime_probe = ImeProbe(self)
             self.ime_probe.start()
-            log("OK 键发送已启用：%s -> %s（仅前台窗口含 %r；"
-                "设备归属由 Raw Input 判定，%dms 内未确认则按最近活动兜底）"
+            log("OK 键发送已启用：%s -> %s（仅前台窗口含 %r）"
                 % (self.send_key_name, self.send_spec,
-                   self.ok_send_title or "<任意>", self.send_confirm_ms))
+                   self.ok_send_title or "<任意>"))
+            log("  判定方式 v1.7：吞掉「按下」、放行「抬起」，"
+                "用抬起那条 Raw Input 的设备归属定性"
+                "（抬起确认超过 %dms 未到则按最近 %dms 活动兜底）"
+                % (self.send_confirm_ms, self.send_fallback_ms))
 
         # 键盘钩子：始终安装（与 ok_to_send 无关）
         #   · 录音期间吞掉遥控器的 F5 —— 不然 WorkBuddy 会把它当成
@@ -2622,26 +2784,25 @@ class App:
             self._want_reconnect = True
 
     def _on_raw_key(self, vkey: int, makecode: int, is_remote: bool):
-        """Raw Input 的原始键盘事件 -> 交给仲裁器判定设备归属。
+        """Raw Input 的**按下**事件。
 
-        🔴 这里顺带打两条**正式日志**（不是 dbg），因为它们是判断
-        「钩子吞键到底会不会挡住原始事件」的唯一证据，必须在普通日志里能看见：
-          · 「Raw 遥控器按下发送键 vk=0x0D」-> 原始事件到了，设备归属明确，
-            走的是精确路径（来源 raw）；
-          · 「Raw 遥控器语音键 vk=0x74 到达（该键会被钩子吞掉）」-> 证明
-            **钩子吞键不影响 Raw Input**，仲裁器可以放心用设备归属判定。
-        两类都做了 1 秒节流，不然按住说话会刷屏。
+        🔴 v1.7：按下被吞时根本不会有这条事件（实测：全吞 0 条），
+        所以这里收到的一定是「我们没吞的那一下」—— 没有 pending 可结算，
+        这个回调现在只负责「记账」：
+          · 实体键盘按了发送键 -> 记下时刻（给时间窗兜底当反向证据）
+          · 遥控器按了键       -> 刷新遥控器活动时间
         """
         try:
             now = time.time()
-            # 🔴 v1.6：记下「最近一次实体键盘按发送键」的时刻 —— 看门狗兜底时
-            #    要用它区分「这次回车是键盘打的」还是「遥控器打的」。
+            # 记下「最近一次实体键盘按发送键」的时刻 —— 时间窗兜底时
+            # 要用它区分「这次回车是键盘打的」还是「遥控器打的」。
             if vkey == self.send_key_vk and not is_remote:
                 if self.remote_input:
                     self.remote_input.last_send_other_ts = now
             if is_remote:
                 if vkey == self.send_key_vk:
-                    log("Raw 遥控器按下发送键 vk=0x%02X -> 设备归属确认" % vkey)
+                    log("Raw 遥控器按下发送键 vk=0x%02X（这次没被吞，"
+                        "说明前置条件不满足）" % vkey)
                 elif vkey == VK_F5:
                     if now - self._last_f5_raw_log > 1.0:
                         self._last_f5_raw_log = now
@@ -2652,10 +2813,23 @@ class App:
                 # 节流 1 秒，否则木木用实体键盘打字时会刷屏。
                 if now - self._last_other_raw_log > 1.0:
                     self._last_other_raw_log = now
-                    log("Raw 其它设备按下发送键 vk=0x%02X -> 不是遥控器，原样补发"
+                    log("Raw 其它设备按下发送键 vk=0x%02X -> 不是遥控器"
                         % vkey)
+        except Exception:
+            pass
+
+    def _on_raw_keyup(self, vkey: int, makecode: int, is_remote: bool):
+        """🔴🔴 v1.7 主路径：**抬起**那条 Raw Input 到了。
+
+        这是整套新架构的落点 ——
+          · 按下被钩子吞掉 -> 没有 Raw Input
+          · 抬起被放行     -> Raw Input 一定会到
+          · 它带的 hDevice = **这一下按键**按下去的设备
+        所以这里的 `is_remote` 是**确定**的，不需要再靠时间窗猜。
+        """
+        try:
             if self.arbiter:
-                self.arbiter.on_raw_keydown(vkey, makecode, is_remote)
+                self.arbiter.on_raw_keyup(vkey, makecode, is_remote)
         except Exception:
             pass
 
@@ -2690,30 +2864,42 @@ class App:
             return False            # 用户自己按着组合键，别掺和
         return True
 
-    def remote_recently(self) -> bool:
-        """看门狗兜底判据：这次被吞掉的发送键，是不是遥控器按的？
+    def send_key_verdict(self):
+        """这次被吞掉的发送键，是不是遥控器按的？返回 (是否遥控器, 依据文字)。
 
-        这是「Raw Input 迟迟没到」时的兜底。
+        🔴 v1.7：这是**兜底**判据（主判据是「抬起那条 Raw Input 的 hDevice」，
+        那是确定的）。只有在抬起确认迟迟不来时才用到这里。
 
-        🔴 v1.6 判据收紧（之前只有一条太宽）：
+        判据（两条都要满足才算遥控器）：
           1. 遥控器在 send_fallback_ms（默认 30 秒）窗口内有过活动
              —— 必须宽，因为「说话 -> 松手 -> 按 OK 键」间隔经常超 10 秒；
-          2. **且**最近一次「实体键盘按发送键」不比遥控器活动更近
-             —— 木木用实体键盘敲回车打字时，别把它误当成遥控器。
+          2. **且**最近一次「实体键盘活动」不比遥控器活动更近
+             —— 木木用实体键盘打字时，别把它误当成遥控器。
 
-        ⚠️ 用「实体键盘**按发送键**」而不是「实体键盘有活动」：
-           木木打字用的是字母键，不该影响这个判定 —— 只看发送键本身。
+        ⚠️ 只看「实体键盘有没有活动」，不看「有没有按发送键」：
+           木木打字用的是字母键，也算「实体键盘活动」，
+           这样「打字之后又用遥控器」的场景不会被误判。
+           反过来，「刚打完字就按回车」会被判成键盘 -> 原样补发，行为不变。
         """
         ri = self.remote_input
         if not ri:
-            return False
+            return False, "没有 Raw Input 监听"
         now = time.time()
-        age_ms = (now - ri.last_activity) * 1000.0
-        if age_ms > self.send_fallback_ms:
-            return False
-        if getattr(ri, "last_send_other_ts", 0.0) > ri.last_activity:
-            return False          # 实体键盘的回车比遥控器活动更近 -> 判为键盘
-        return True
+        last_remote = getattr(ri, "last_activity", 0.0)
+        if not last_remote:
+            return False, "还没见过遥控器按键"
+        age = now - last_remote
+        if age * 1000.0 > self.send_fallback_ms:
+            return False, ("遥控器 %.0f 秒前才活动过，超出 %dms 窗口"
+                           % (age, self.send_fallback_ms))
+        last_phys = getattr(ri, "last_physical_ts", 0.0)
+        if last_phys > last_remote:
+            return False, "最近一次键盘活动来自实体键盘"
+        return True, "遥控器 %.1f 秒内有活动" % age
+
+    def remote_recently(self) -> bool:
+        """兼容旧接口：等价于 send_key_verdict()[0]。"""
+        return self.send_key_verdict()[0]
 
     def _on_begin(self):
         if not self.enabled:
@@ -2811,7 +2997,9 @@ class App:
                     kind = kinds.get(wparam, str(wparam))
                     src = "INJ" if (flags & LLKHF_INJECTED) else "HW "
                     if tag == "SND":
-                        src = "SND"          # 发送键被仲裁器吞，等设备归属确认
+                        src = "SND"          # 发送键「按下」被仲裁器吞
+                    elif tag == "UPE":
+                        src = "UPE"          # 发送键「抬起」放行 -> Raw Input 会到
                     elif tag == "SWAL" or swallowed:
                         src = "SWAL"          # 被 MiVoice 拦下，没送到 WorkBuddy
                     f.write("%s  %-7s vk=0x%02X scan=0x%02X flags=0x%X %s "
